@@ -138,6 +138,10 @@ Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should incl
 
 Currently nanobanana2 is wired to Gemini 3.1 Flash Image and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, DALL-E, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
 
+## Built by Duval Software
+
+nanobanana2-mcp is maintained by [John Evans](https://github.com/j-east), part of the engineering team at [Duval Software](https://duvalsoftware.com) — a software engineering firm in Jacksonville Beach, FL building AI-powered tools and custom integrations. If you need MCP servers, AI pipelines, or production tooling built, [get in touch](https://duvalsoftware.com).
+
 ## License
 
 MIT
