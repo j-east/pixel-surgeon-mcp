@@ -1,0 +1,1421 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import sharp from "sharp";
+import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { randomUUID } from "crypto";
+import { writeFile, readFile, mkdir, readdir, copyFile, stat } from "fs/promises";
+import { join, basename, extname } from "path";
+import { homedir } from "os";
+
+const SAVE_DIR = join(homedir(), "Pictures", "nanobanana2");
+
+const API_KEY = process.env.GOOGLE_API_KEY!;
+const MODEL = "gemini-3.1-flash-image-preview";
+const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+const MAX_MCP_BYTES = 950_000;
+
+function log(msg: string) {
+  console.error(`[nanobanana2 ${new Date().toISOString()}] ${msg}`);
+}
+
+// --- Image store & viewer ---
+
+interface StoredImage {
+  id: string;
+  prompt: string;
+  fullPng: Buffer;
+  timestamp: number;
+  filename: string;
+}
+
+const imageStore: StoredImage[] = [];
+let viewerPort: number | null = null;
+const sseClients = new Set<ServerResponse>();
+
+// --- Interactive crop callback system ---
+
+interface CropSubmission {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  prompt: string;
+}
+
+interface CropResult {
+  ok: boolean;
+  filename?: string;
+  error?: string;
+}
+
+const pendingCrops = new Map<string, {
+  resolve: (val: CropSubmission) => void;
+  onComplete: Promise<CropResult>;
+  completeResolve: (val: CropResult) => void;
+}>();
+
+function notifyViewerClients(img: StoredImage) {
+  const event = JSON.stringify({ id: img.id, prompt: img.prompt });
+  for (const client of sseClients) {
+    client.write(`data: ${event}\n\n`);
+  }
+}
+
+function startViewer(): Promise<number> {
+  return new Promise((resolve) => {
+    const srv = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? "/", `http://localhost`);
+
+      if (url.pathname.startsWith("/img/")) {
+        const id = url.pathname.slice(5);
+        const img = imageStore.find((i) => i.id === id);
+        if (img) {
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Cache-Control": "public, max-age=31536000, immutable",
+          });
+          res.end(img.fullPng);
+          return;
+        }
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+
+      // Serve image files directly from disk by filename
+      if (url.pathname.startsWith("/file/")) {
+        const fname = decodeURIComponent(url.pathname.slice(6));
+        const fpath = join(SAVE_DIR, fname);
+        readFile(fpath)
+          .then((buf) => {
+            const ext = extname(fname).toLowerCase();
+            const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
+            res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" });
+            res.end(buf);
+          })
+          .catch(() => {
+            res.writeHead(404);
+            res.end("Not found");
+          });
+        return;
+      }
+
+      // Interactive crop UI
+      if (url.pathname.startsWith("/crop/")) {
+        const fname = decodeURIComponent(url.pathname.slice(6));
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(cropHtml(fname));
+        return;
+      }
+
+      // Crop submission endpoint
+      if (url.pathname === "/crop-submit" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+        req.on("end", async () => {
+          try {
+            const data = JSON.parse(body);
+            const { filename, x, y, width, height, prompt } = data;
+            const pending = pendingCrops.get(filename);
+            if (pending) {
+              // Resolve the MCP tool's await with the crop data
+              pending.resolve({ x, y, width, height, prompt: prompt || "" });
+              // Hold this HTTP response open until Gemini processing completes
+              const result = await pending.onComplete;
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(result));
+            } else {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "No pending crop for this filename" }));
+            }
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+          }
+        });
+        return;
+      }
+
+      if (url.pathname === "/open-folder") {
+        import("child_process").then(({ exec }) => exec(`open "${SAVE_DIR}"`));
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (url.pathname === "/events") {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        const interval = setInterval(() => res.write(":\n\n"), 30000);
+        sseClients.add(res);
+        req.on("close", () => {
+          clearInterval(interval);
+          sseClients.delete(res);
+        });
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(viewerHtml());
+    });
+
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve(port);
+    });
+  });
+}
+
+function viewerHtml(): string {
+  const images = [...imageStore].reverse();
+  const imgTags = images
+    .map(
+      (img) =>
+        `<div class="img-entry" id="img-${img.id}">
+          <p>${esc(img.prompt)}</p>
+          <img src="/img/${img.id}" />
+        </div>`
+    )
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html><head><title>Nanobanana2</title>
+<style>
+  body { margin: 20px; background: #1a1a1a; color: #ccc; font-family: system-ui; }
+  img { max-width: 100%; }
+  div.img-entry { margin-bottom: 24px; }
+  p { margin: 0 0 8px 0; font-size: 14px; color: #999; }
+  #empty { display: ${images.length === 0 ? "block" : "none"}; }
+  #open-folder { background: #333; color: #ccc; border: 1px solid #555; padding: 8px 16px; cursor: pointer; font-size: 14px; font-family: system-ui; margin-bottom: 20px; }
+  #open-folder:hover { background: #444; }
+</style></head><body>
+<button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
+<p id="empty">Waiting for images...</p>
+<div id="gallery">${imgTags}</div>
+<script>
+const gallery = document.getElementById("gallery");
+const empty = document.getElementById("empty");
+const es = new EventSource("/events");
+es.onmessage = (e) => {
+  const { id, prompt } = JSON.parse(e.data);
+  empty.style.display = "none";
+  const div = document.createElement("div");
+  div.className = "img-entry";
+  div.id = "img-" + id;
+  const p = document.createElement("p");
+  p.textContent = prompt;
+  const img = document.createElement("img");
+  img.src = "/img/" + id;
+  div.appendChild(p);
+  div.appendChild(img);
+  gallery.prepend(div);
+};
+</script>
+</body></html>`;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function cropHtml(filename: string): string {
+  return `<!DOCTYPE html>
+<html><head><title>Fix Region — ${esc(filename)}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; color: #ccc; font-family: system-ui; display: flex; flex-direction: column; height: 100vh; }
+  .toolbar { padding: 12px 16px; background: #1a1a1a; border-bottom: 1px solid #333; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .toolbar h2 { font-size: 15px; color: #eee; margin-right: 8px; }
+  .toolbar label { font-size: 13px; color: #999; }
+  .toolbar textarea { flex: 1; min-width: 300px; height: 56px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 8px; font-size: 13px; font-family: system-ui; resize: vertical; }
+  .toolbar button { background: #2d7d46; color: #fff; border: none; padding: 10px 24px; border-radius: 4px; font-size: 14px; cursor: pointer; font-weight: 600; }
+  .toolbar button:hover { background: #38a55a; }
+  .toolbar button:disabled { background: #555; cursor: not-allowed; }
+  .canvas-wrap { flex: 1; overflow: auto; position: relative; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+  canvas { cursor: crosshair; max-width: 100%; }
+  .coords { font-size: 12px; color: #666; min-width: 180px; text-align: right; }
+  .status { font-size: 13px; color: #ffcc00; padding: 8px 16px; background: #1a1a1a; border-top: 1px solid #333; }
+  .status.done { color: #4caf50; }
+  .status.error { color: #f44336; }
+</style></head><body>
+<div class="toolbar">
+  <h2>Select region to fix</h2>
+  <label>Notes / instructions:</label>
+  <textarea id="prompt" placeholder="e.g. '36GB should be 96GB', 'fix the garbled text in this section'">Clean up and fix any garbled, glitched, or distorted text. Preserve style, colors, and layout.</textarea>
+  <button id="submit" disabled>Submit Region</button>
+  <div class="coords" id="coords">Draw a rectangle on the image</div>
+</div>
+<div class="canvas-wrap">
+  <canvas id="canvas"></canvas>
+</div>
+<div class="status" id="status">Loading image...</div>
+<script>
+const filename = ${JSON.stringify(filename)};
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const coordsEl = document.getElementById("coords");
+const statusEl = document.getElementById("status");
+const submitBtn = document.getElementById("submit");
+const promptEl = document.getElementById("prompt");
+
+const img = new Image();
+img.onload = () => {
+  // Scale to fit viewport while keeping full resolution for coordinates
+  const maxW = window.innerWidth - 32;
+  const maxH = window.innerHeight - 160;
+  const scale = Math.min(1, maxW / img.width, maxH / img.height);
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  canvas.dataset.scale = scale;
+  canvas.dataset.imgW = img.width;
+  canvas.dataset.imgH = img.height;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  statusEl.textContent = img.width + "x" + img.height + " — click and drag to select a region";
+};
+img.src = "/file/" + encodeURIComponent(filename);
+
+let drawing = false;
+let startX = 0, startY = 0, endX = 0, endY = 0;
+let hasSelection = false;
+
+canvas.addEventListener("mousedown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  startX = e.clientX - rect.left;
+  startY = e.clientY - rect.top;
+  drawing = true;
+  hasSelection = false;
+  submitBtn.disabled = true;
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (!drawing) return;
+  const rect = canvas.getBoundingClientRect();
+  endX = e.clientX - rect.left;
+  endY = e.clientY - rect.top;
+  redraw();
+});
+
+canvas.addEventListener("mouseup", (e) => {
+  if (!drawing) return;
+  drawing = false;
+  const rect = canvas.getBoundingClientRect();
+  endX = e.clientX - rect.left;
+  endY = e.clientY - rect.top;
+  const sel = getSelection();
+  if (sel.w > 5 && sel.h > 5) {
+    hasSelection = true;
+    submitBtn.disabled = false;
+    redraw();
+  }
+});
+
+function getSelection() {
+  const x = Math.min(startX, endX);
+  const y = Math.min(startY, endY);
+  const w = Math.abs(endX - startX);
+  const h = Math.abs(endY - startY);
+  return { x, y, w, h };
+}
+
+function toPercent(sel) {
+  const cw = canvas.width;
+  const ch = canvas.height;
+  return {
+    x: (sel.x / cw) * 100,
+    y: (sel.y / ch) * 100,
+    width: (sel.w / cw) * 100,
+    height: (sel.h / ch) * 100,
+  };
+}
+
+function redraw() {
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const sel = getSelection();
+  if (sel.w > 2 && sel.h > 2) {
+    // Dim everything outside selection
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(0, 0, canvas.width, sel.y); // top
+    ctx.fillRect(0, sel.y + sel.h, canvas.width, canvas.height - sel.y - sel.h); // bottom
+    ctx.fillRect(0, sel.y, sel.x, sel.h); // left
+    ctx.fillRect(sel.x + sel.w, sel.y, canvas.width - sel.x - sel.w, sel.h); // right
+
+    // Selection border
+    ctx.strokeStyle = "#4caf50";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sel.x, sel.y, sel.w, sel.h);
+
+    const pct = toPercent(sel);
+    coordsEl.textContent = pct.x.toFixed(1) + "%, " + pct.y.toFixed(1) + "% — " + pct.width.toFixed(1) + "% x " + pct.height.toFixed(1) + "%";
+  }
+}
+
+submitBtn.addEventListener("click", async () => {
+  if (!hasSelection) return;
+  const sel = getSelection();
+  const pct = toPercent(sel);
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Processing...";
+  statusEl.textContent = "Sending region to Gemini for fixing...";
+  statusEl.className = "status";
+
+  try {
+    statusEl.textContent = "Region submitted — waiting for Gemini to process...";
+    statusEl.className = "status";
+    const resp = await fetch("/crop-submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename,
+        x: pct.x,
+        y: pct.y,
+        width: pct.width,
+        height: pct.height,
+        prompt: promptEl.value,
+      }),
+    });
+    const result = await resp.json();
+    if (result.ok) {
+      statusEl.textContent = "Done! Saved as " + result.filename;
+      statusEl.className = "status done";
+      // Show the fixed image below
+      const resultImg = document.createElement("img");
+      resultImg.src = "/file/" + encodeURIComponent(result.filename);
+      resultImg.style.maxWidth = "100%";
+      resultImg.style.marginTop = "16px";
+      document.querySelector(".canvas-wrap").appendChild(resultImg);
+      submitBtn.textContent = "Complete";
+    } else {
+      statusEl.textContent = "Error: " + (result.error || "Unknown");
+      statusEl.className = "status error";
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Submit Region";
+    }
+  } catch (err) {
+    statusEl.textContent = "Network error: " + err.message;
+    statusEl.className = "status error";
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Submit Region";
+  }
+});
+</script>
+</body></html>`;
+}
+
+// --- Histogram matching ---
+
+/**
+ * Match the brightness/contrast of a fixed region to the original region.
+ * Uses per-channel linear normalization: output = (input - fixedMean) * (origStdev / fixedStdev) + origMean
+ * This ensures the composited region blends seamlessly with the surrounding image.
+ */
+async function matchHistogram(fixedBuf: Buffer, originalBuf: Buffer): Promise<Buffer> {
+  const [fixedStats, origStats] = await Promise.all([
+    sharp(fixedBuf).stats(),
+    sharp(originalBuf).stats(),
+  ]);
+
+  // Build per-channel linear transform: output = input * a + b
+  // where a = origStdev / fixedStdev, b = origMean - fixedMean * a
+  const multipliers: number[] = [];
+  const offsets: number[] = [];
+
+  // Process R, G, B channels (skip alpha if present)
+  const channels = Math.min(fixedStats.channels.length, origStats.channels.length, 3);
+  for (let i = 0; i < channels; i++) {
+    const origCh = origStats.channels[i];
+    const fixedCh = fixedStats.channels[i];
+
+    // Avoid division by zero — if fixed channel has no variance, just shift the mean
+    const a = fixedCh.stdev > 0.001 ? origCh.stdev / fixedCh.stdev : 1;
+    const b = origCh.mean - fixedCh.mean * a;
+
+    // Clamp the multiplier to avoid extreme adjustments
+    const clampedA = Math.max(0.5, Math.min(2.0, a));
+    const clampedB = origCh.mean - fixedCh.mean * clampedA;
+
+    multipliers.push(clampedA);
+    offsets.push(clampedB);
+  }
+
+  log(`  Histogram match: R(×${multipliers[0]?.toFixed(2)}+${offsets[0]?.toFixed(1)}) G(×${multipliers[1]?.toFixed(2)}+${offsets[1]?.toFixed(1)}) B(×${multipliers[2]?.toFixed(2)}+${offsets[2]?.toFixed(1)})`);
+
+  return sharp(fixedBuf)
+    .linear(multipliers, offsets)
+    .toBuffer();
+}
+
+// --- Image resizing for MCP ---
+
+async function shrinkForMcp(pngBuffer: Buffer): Promise<{ base64: string; mime: string }> {
+  const origBase64 = pngBuffer.toString("base64");
+  if (origBase64.length <= MAX_MCP_BYTES) {
+    log(`  MCP size: ${(origBase64.length / 1024).toFixed(0)}KB PNG (no resize needed)`);
+    return { base64: origBase64, mime: "image/png" };
+  }
+
+  const metadata = await sharp(pngBuffer).metadata();
+  const origWidth = metadata.width ?? 1024;
+  log(`  Original: ${origWidth}x${metadata.height} PNG, ${(origBase64.length / 1024).toFixed(0)}KB base64`);
+
+  for (const scale of [0.75, 0.5, 0.35, 0.25]) {
+    const width = Math.round(origWidth * scale);
+    const buf = await sharp(pngBuffer).resize(width).jpeg({ quality: 80 }).toBuffer();
+    const b64 = buf.toString("base64");
+    if (b64.length <= MAX_MCP_BYTES) {
+      log(`  MCP size: ${(b64.length / 1024).toFixed(0)}KB JPEG @ ${Math.round(scale * 100)}% (${width}px wide)`);
+      return { base64: b64, mime: "image/jpeg" };
+    }
+  }
+
+  const buf = await sharp(pngBuffer).resize(256).jpeg({ quality: 60 }).toBuffer();
+  const b64 = buf.toString("base64");
+  log(`  MCP size: ${(b64.length / 1024).toFixed(0)}KB JPEG @ 256px (last resort)`);
+  return { base64: b64, mime: "image/jpeg" };
+}
+
+// --- Shared directory helpers ---
+
+async function ensureSaveDir() {
+  await mkdir(SAVE_DIR, { recursive: true });
+}
+
+/** Save a buffer to the shared dir, return the filename */
+async function saveToDisk(buf: Buffer, label: string, ext = ".png"): Promise<string> {
+  await ensureSaveDir();
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `${ts}_${label}${ext}`;
+  await writeFile(join(SAVE_DIR, filename), buf);
+  return filename;
+}
+
+/** Load an image from the shared dir by filename, compress for Gemini input */
+async function loadForGemini(filename: string): Promise<{ base64: string; mime: string }> {
+  const filepath = join(SAVE_DIR, filename);
+  const buf = await readFile(filepath);
+  const metadata = await sharp(buf).metadata();
+  const width = metadata.width ?? 1024;
+  log(`  Source file: ${filename} (${width}x${metadata.height}, ${(buf.length / 1024).toFixed(0)}KB)`);
+
+  // Compress to max 1024px wide JPEG for fast Gemini upload
+  if (width > 1024 || buf.length > 500_000) {
+    const resized = await sharp(buf)
+      .resize(Math.min(width, 1024))
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    log(`  Compressed for Gemini: ${(resized.length / 1024).toFixed(0)}KB JPEG`);
+    return { base64: resized.toString("base64"), mime: "image/jpeg" };
+  }
+
+  const ext = extname(filename).toLowerCase();
+  const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
+  return { base64: buf.toString("base64"), mime };
+}
+
+// --- Gemini API ---
+
+interface GeminiPart {
+  text?: string;
+  inlineData?: { mimeType: string; data: string };
+}
+
+interface GeminiResponse {
+  candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
+  error?: { message: string };
+}
+
+async function callGemini(
+  inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
+  aspectRatio: string,
+  imageSize: string
+): Promise<{ imageBase64: string; text: string }> {
+  const t0 = Date.now();
+  log(`  Calling Gemini API (${imageSize}, ${aspectRatio}, ${inputParts.length} parts)...`);
+
+  let res: Response;
+  try {
+    res = await fetch(`${ENDPOINT}?key=${API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: inputParts }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          imageConfig: { aspectRatio, imageSize },
+        },
+      }),
+    });
+  } catch (fetchErr: unknown) {
+    throw new Error(
+      `Network error calling Gemini API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`
+    );
+  }
+
+  const elapsed = Date.now() - t0;
+  log(`  Gemini responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+
+  const rawBody = await res.text();
+  let data: GeminiResponse;
+  try {
+    data = JSON.parse(rawBody);
+  } catch {
+    throw new Error(`Gemini API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+  }
+
+  if (!res.ok || data.error) {
+    const safeBody = rawBody.length > 3000 ? rawBody.slice(0, 3000) + "... [truncated]" : rawBody;
+    throw new Error(`Gemini API HTTP ${res.status}: ${data.error?.message ?? "unknown error"}. Full response: ${safeBody}`);
+  }
+
+  const candidate = data.candidates?.[0];
+  if (!candidate?.content?.parts?.length) {
+    throw new Error(
+      `Gemini API returned no content parts. Full response: ${JSON.stringify(data, (k, v) => (k === "data" && typeof v === "string" && v.length > 100 ? "[truncated]" : v))}`
+    );
+  }
+
+  const responseParts = candidate.content.parts;
+  let imageBase64 = "";
+  let text = "";
+  for (const part of responseParts) {
+    if (part.inlineData) imageBase64 = part.inlineData.data;
+    if (part.text) text = part.text;
+  }
+
+  if (!imageBase64) {
+    const textContent = text ? `Model responded with text: "${text.slice(0, 1000)}"` : "No text content either.";
+    throw new Error(
+      `Gemini returned no image. ${textContent} | Parts structure: ${JSON.stringify(responseParts.map((p) => ({ hasText: !!p.text, hasInlineData: !!p.inlineData })))}`
+    );
+  }
+
+  log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64`);
+  return { imageBase64, text };
+}
+
+/** Generate, store, return shrunk for MCP */
+async function generateAndStore(
+  prompt: string,
+  aspectRatio: string,
+  imageSize: string
+): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string }> {
+  const { imageBase64, text } = await callGemini([{ text: prompt }], aspectRatio, imageSize);
+
+  const fullPng = Buffer.from(imageBase64, "base64");
+  const id = randomUUID();
+  const filename = await saveToDisk(fullPng, id.slice(0, 8));
+  log(`  Saved ${filename}`);
+
+  const img: StoredImage = { id, prompt, fullPng, timestamp: Date.now(), filename };
+  imageStore.push(img);
+  notifyViewerClients(img);
+
+  const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
+  return { mcpBase64, mcpMimeType, text, filename };
+}
+
+/** Edit, store, return shrunk for MCP */
+async function editAndStore(
+  prompt: string,
+  sourceBase64: string,
+  sourceMime: string,
+  aspectRatio: string,
+  imageSize: string
+): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string }> {
+  const { imageBase64, text } = await callGemini(
+    [
+      { text: prompt },
+      { inlineData: { mimeType: sourceMime, data: sourceBase64 } },
+    ],
+    aspectRatio,
+    imageSize
+  );
+
+  const fullPng = Buffer.from(imageBase64, "base64");
+  const id = randomUUID();
+  const filename = await saveToDisk(fullPng, id.slice(0, 8));
+  log(`  Saved ${filename}`);
+
+  const img: StoredImage = { id, prompt: `[edit] ${prompt}`, fullPng, timestamp: Date.now(), filename };
+  imageStore.push(img);
+  notifyViewerClients(img);
+
+  const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
+  return { mcpBase64, mcpMimeType, text, filename };
+}
+
+// --- MCP server ---
+
+const server = new McpServer(
+  { name: "nanobanana2", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.tool(
+  "list_images",
+  `List image files in the shared nanobanana2 directory (${SAVE_DIR}). Use this to find images available for editing.`,
+  {},
+  async () => {
+    try {
+      await ensureSaveDir();
+      const files = await readdir(SAVE_DIR);
+      const imageFiles = files.filter((f) =>
+        /\.(png|jpg|jpeg|webp)$/i.test(f)
+      );
+      imageFiles.sort().reverse(); // newest first
+
+      const entries = [];
+      for (const f of imageFiles.slice(0, 50)) {
+        const s = await stat(join(SAVE_DIR, f));
+        entries.push(`${f} (${(s.size / 1024).toFixed(0)}KB)`);
+      }
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: entries.length > 0
+            ? `Images in ${SAVE_DIR}:\n${entries.join("\n")}`
+            : `No images in ${SAVE_DIR}`,
+        }],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text" as const, text: `list_images failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "save_image",
+  `Copy an image file into the shared nanobanana2 directory (${SAVE_DIR}) so it can be used with edit_image. Use this when the user wants to edit an image that exists elsewhere on their filesystem.`,
+  {
+    source_path: z.string().describe("Absolute path to the image file to import"),
+  },
+  async ({ source_path }) => {
+    try {
+      await ensureSaveDir();
+      const ext = extname(source_path).toLowerCase() || ".png";
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const destFilename = `${ts}_imported${ext}`;
+      const destPath = join(SAVE_DIR, destFilename);
+
+      await copyFile(source_path, destPath);
+      const s = await stat(destPath);
+      log(`save_image: copied ${source_path} -> ${destFilename} (${(s.size / 1024).toFixed(0)}KB)`);
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Saved as ${destFilename} in ${SAVE_DIR} (${(s.size / 1024).toFixed(0)}KB). You can now use this filename with edit_image.`,
+        }],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`save_image error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `save_image failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "generate_images",
+  "Generate multiple images in parallel using Google's Nanobanana2 (Gemini 3.1 Flash Image). Returns the generated images and any accompanying text. Full-resolution images are viewable in the browser viewer.",
+  {
+    prompts: z
+      .array(z.string())
+      .min(1)
+      .max(8)
+      .describe("Array of text prompts, one per image to generate (1-8 images)"),
+    aspect_ratio: z
+      .enum(["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"])
+      .default("1:1")
+      .describe("Aspect ratio for all generated images"),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Image resolution"),
+  },
+  async ({ prompts, aspect_ratio, image_size }) => {
+    try {
+      await ensureViewer();
+      log(`generate_images: ${prompts.length} prompts, ${image_size}, ${aspect_ratio}`);
+      const t0 = Date.now();
+
+      const results = await Promise.allSettled(
+        prompts.map((prompt, i) => {
+          log(`  [${i + 1}/${prompts.length}] "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`);
+          return generateAndStore(prompt, aspect_ratio, image_size);
+        })
+      );
+
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [];
+
+      let anySucceeded = false;
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        if (result.status === "fulfilled") {
+          anySucceeded = true;
+          content.push({
+            type: "text" as const,
+            text: `Image ${i + 1}: ${result.value.filename}${result.value.text ? ` — ${result.value.text}` : ""}`,
+          });
+          content.push({
+            type: "image" as const,
+            data: result.value.mcpBase64,
+            mimeType: result.value.mcpMimeType,
+          });
+        } else {
+          content.push({
+            type: "text" as const,
+            text: `Image ${i + 1} failed (prompt: "${prompts[i]}"): ${result.reason?.message ?? "Unknown error"}`,
+          });
+        }
+      }
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      log(`generate_images complete: ${results.filter((r) => r.status === "fulfilled").length}/${prompts.length} succeeded in ${elapsed}s`);
+
+      content.push({
+        type: "text" as const,
+        text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}`,
+      });
+
+      if (!anySucceeded) return { content, isError: true };
+      return { content };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`generate_images error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `generate_images failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "generate_image",
+  "Generate a single image using Google's Nanobanana2 (Gemini 3.1 Flash Image). Full-resolution image is viewable in the browser viewer.",
+  {
+    prompt: z.string().describe("Text prompt describing the image to generate"),
+    aspect_ratio: z
+      .enum(["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"])
+      .default("1:1")
+      .describe("Aspect ratio for the image"),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Image resolution"),
+  },
+  async ({ prompt, aspect_ratio, image_size }) => {
+    try {
+      await ensureViewer();
+      log(`generate_image: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" (${image_size}, ${aspect_ratio})`);
+      const t0 = Date.now();
+
+      const { mcpBase64, mcpMimeType, text, filename } = await generateAndStore(prompt, aspect_ratio, image_size);
+
+      log(`generate_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+      return {
+        content: [
+          ...(text ? [{ type: "text" as const, text }] : []),
+          { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
+          { type: "text" as const, text: `Saved as ${filename} — full-res at http://localhost:${viewerPort}` },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`generate_image error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `generate_image failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "edit_image",
+  `Edit an existing image using Google's Nanobanana2 (Gemini 3.1 Flash Image). Provide the filename of an image in ${SAVE_DIR} (use list_images to see available files, or save_image to import one first). The MCP reads the file directly — do NOT pass base64 image data.`,
+  {
+    prompt: z.string().describe("Text prompt describing the edits to make to the image"),
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR} (e.g. "2026-03-17T17-47-31-152Z_59f735df.png")`),
+    aspect_ratio: z
+      .enum(["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"])
+      .default("1:1")
+      .describe("Aspect ratio for the output image"),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Output image resolution"),
+  },
+  async ({ prompt, filename, aspect_ratio, image_size }) => {
+    try {
+      await ensureViewer();
+      log(`edit_image: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${aspect_ratio})`);
+      const t0 = Date.now();
+
+      const { base64: srcBase64, mime: srcMime } = await loadForGemini(filename);
+
+      const { mcpBase64, mcpMimeType, text, filename: outFilename } = await editAndStore(
+        prompt,
+        srcBase64,
+        srcMime,
+        aspect_ratio,
+        image_size
+      );
+
+      log(`edit_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+      return {
+        content: [
+          ...(text ? [{ type: "text" as const, text }] : []),
+          { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
+          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`edit_image error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `edit_image failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "fix_image",
+  `Fix an image that has glitched or garbled text by splitting it into tiles, re-rendering each tile through Gemini, and stitching them back together. This works because smaller sections have less text for the model to handle at once. Use this when a generated image has text artifacts or overloaded text regions.`,
+  {
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    prompt: z
+      .string()
+      .default("Clean up and fix any garbled, glitched, or distorted text in this image tile. Preserve the style, colors, and layout exactly but make all text crisp and legible.")
+      .describe("Instructions for fixing each tile"),
+    grid: z
+      .enum(["2x2", "3x3", "2x1", "1x2", "3x1", "1x3"])
+      .default("2x2")
+      .describe("How to split the image: cols x rows"),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Resolution for each tile's Gemini call"),
+  },
+  async ({ filename, prompt, grid, image_size }) => {
+    try {
+      await ensureViewer();
+      log(`fix_image: source=${filename} grid=${grid}`);
+      const t0 = Date.now();
+
+      // Parse grid
+      const [colStr, rowStr] = grid.split("x");
+      const cols = parseInt(colStr, 10);
+      const rows = parseInt(rowStr, 10);
+
+      // Load source image
+      const filepath = join(SAVE_DIR, filename);
+      const srcBuf = await readFile(filepath);
+      const metadata = await sharp(srcBuf).metadata();
+      const imgWidth = metadata.width!;
+      const imgHeight = metadata.height!;
+      log(`  Source: ${imgWidth}x${imgHeight}`);
+
+      const tileW = Math.floor(imgWidth / cols);
+      const tileH = Math.floor(imgHeight / rows);
+
+      // Extract tiles
+      const tiles: Array<{ col: number; row: number; buffer: Buffer }> = [];
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          const left = col * tileW;
+          const top = row * tileH;
+          // Last tile in each direction extends to the edge
+          const width = col === cols - 1 ? imgWidth - left : tileW;
+          const height = row === rows - 1 ? imgHeight - top : tileH;
+          const buf = await sharp(srcBuf)
+            .extract({ left, top, width, height })
+            .png()
+            .toBuffer();
+          tiles.push({ col, row, buffer: buf });
+        }
+      }
+
+      log(`  Extracted ${tiles.length} tiles (${tileW}x${tileH} each)`);
+
+      // Compute aspect ratio closest to tile dimensions for Gemini
+      const tileAspect = tileW / tileH;
+      const bestAspect = ASPECT_RATIOS.reduce((best, opt) =>
+        Math.abs(Math.log(opt.ratio / tileAspect)) < Math.abs(Math.log(best.ratio / tileAspect)) ? opt : best
+      );
+      log(`  Tile aspect ~${tileAspect.toFixed(2)}, using ${bestAspect.label}`);
+
+      // Send each tile to Gemini in parallel
+      const fixResults = await Promise.allSettled(
+        tiles.map(async (tile, i) => {
+          log(`  [tile ${i + 1}/${tiles.length}] sending to Gemini...`);
+          // Compress tile for Gemini
+          const tileSharp = sharp(tile.buffer);
+          const tileMeta = await tileSharp.metadata();
+          let sendBuf: Buffer;
+          let sendMime: string;
+          if ((tileMeta.width ?? 0) > 1024 || tile.buffer.length > 500_000) {
+            sendBuf = await sharp(tile.buffer).resize(Math.min(tileMeta.width ?? 1024, 1024)).jpeg({ quality: 85 }).toBuffer();
+            sendMime = "image/jpeg";
+          } else {
+            sendBuf = tile.buffer;
+            sendMime = "image/png";
+          }
+
+          const { imageBase64 } = await callGemini(
+            [
+              { text: prompt },
+              { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
+            ],
+            bestAspect.label,
+            image_size
+          );
+
+          return { col: tile.col, row: tile.row, buffer: Buffer.from(imageBase64, "base64") };
+        })
+      );
+
+      // Check for failures
+      const failed = fixResults.filter((r) => r.status === "rejected");
+      if (failed.length === fixResults.length) {
+        throw new Error(`All ${fixResults.length} tiles failed. First error: ${(failed[0] as PromiseRejectedResult).reason?.message}`);
+      }
+      if (failed.length > 0) {
+        log(`  WARNING: ${failed.length}/${fixResults.length} tiles failed, using originals for those`);
+      }
+
+      // Build fixed tile map, falling back to original tile on failure
+      const fixedTiles = fixResults.map((result, i) => {
+        if (result.status === "fulfilled") {
+          return result.value;
+        }
+        log(`  Tile ${i + 1} failed, using original: ${(result as PromiseRejectedResult).reason?.message}`);
+        return tiles[i];
+      });
+
+      // Resize each fixed tile back to exact tile dimensions and composite
+      const compositeInputs: Array<{ input: Buffer; left: number; top: number }> = [];
+      for (const tile of fixedTiles) {
+        const left = tile.col * tileW;
+        const top = tile.row * tileH;
+        const width = tile.col === cols - 1 ? imgWidth - left : tileW;
+        const height = tile.row === rows - 1 ? imgHeight - top : tileH;
+        const resized = await sharp(tile.buffer)
+          .resize(width, height, { fit: "fill" })
+          .png()
+          .toBuffer();
+        compositeInputs.push({ input: resized, left, top });
+      }
+
+      const finalBuf = await sharp({
+        create: { width: imgWidth, height: imgHeight, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 1 } },
+      })
+        .composite(compositeInputs)
+        .png()
+        .toBuffer();
+
+      // Save result
+      const id = randomUUID();
+      const outFilename = await saveToDisk(finalBuf, `fix_${id.slice(0, 8)}`);
+      log(`  Stitched ${fixedTiles.length} tiles -> ${outFilename}`);
+
+      const img: StoredImage = {
+        id,
+        prompt: `[fix ${grid}] ${prompt.slice(0, 60)}`,
+        fullPng: finalBuf,
+        timestamp: Date.now(),
+        filename: outFilename,
+      };
+      imageStore.push(img);
+      notifyViewerClients(img);
+
+      const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(finalBuf);
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      const successCount = fixResults.filter((r) => r.status === "fulfilled").length;
+
+      log(`fix_image complete in ${elapsed}s (${successCount}/${fixResults.length} tiles succeeded)`);
+
+      return {
+        content: [
+          { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
+          {
+            type: "text" as const,
+            text: `Fixed ${successCount}/${tiles.length} tiles (${grid} grid). Saved as ${outFilename} — full-res at http://localhost:${viewerPort}`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`fix_image error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `fix_image failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Aspect ratio snapping helper ---
+
+const ASPECT_RATIOS = [
+  { label: "1:1", ratio: 1 },
+  { label: "16:9", ratio: 16 / 9 },
+  { label: "9:16", ratio: 9 / 16 },
+  { label: "3:4", ratio: 3 / 4 },
+  { label: "4:3", ratio: 4 / 3 },
+  { label: "2:3", ratio: 2 / 3 },
+  { label: "3:2", ratio: 3 / 2 },
+  { label: "4:5", ratio: 4 / 5 },
+  { label: "5:4", ratio: 5 / 4 },
+] as const;
+
+/**
+ * Given a crop region, snap it to the nearest Gemini aspect ratio.
+ * Adjusts width/height to match the ratio while keeping the center point,
+ * clamped to image bounds.
+ */
+function snapToAspectRatio(
+  x: number, y: number, w: number, h: number,
+  imgWidth: number, imgHeight: number
+): { left: number; top: number; width: number; height: number; aspectLabel: string } {
+  const cropRatio = w / h;
+  const best = ASPECT_RATIOS.reduce((a, b) =>
+    Math.abs(Math.log(a.ratio / cropRatio)) <= Math.abs(Math.log(b.ratio / cropRatio)) ? a : b
+  );
+
+  // Adjust dimensions to match the snapped ratio, keeping area roughly the same
+  const centerX = x + w / 2;
+  const centerY = y + h / 2;
+  let newW: number, newH: number;
+
+  if (best.ratio > cropRatio) {
+    // Need wider — expand width, keep height
+    newH = h;
+    newW = Math.round(h * best.ratio);
+  } else {
+    // Need taller — expand height, keep width
+    newW = w;
+    newH = Math.round(w / best.ratio);
+  }
+
+  // Re-center and clamp to image bounds
+  let left = Math.round(centerX - newW / 2);
+  let top = Math.round(centerY - newH / 2);
+
+  if (left < 0) left = 0;
+  if (top < 0) top = 0;
+  if (left + newW > imgWidth) left = imgWidth - newW;
+  if (top + newH > imgHeight) top = imgHeight - newH;
+
+  // If still out of bounds (region larger than image), clamp dimensions
+  if (left < 0) { left = 0; newW = imgWidth; }
+  if (top < 0) { top = 0; newH = imgHeight; }
+
+  return { left, top, width: newW, height: newH, aspectLabel: best.label };
+}
+
+server.tool(
+  "fix_region",
+  `Fix a specific region of an image by cropping it out, sending it to Gemini for repair, and reinserting it. The crop is automatically snapped to the nearest Gemini-supported aspect ratio. Use this when only part of an image has glitched text or artifacts — more precise than fix_image's grid approach.`,
+  {
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    prompt: z
+      .string()
+      .default("Clean up and fix any garbled, glitched, or distorted text in this image region. Preserve the style, colors, and layout exactly but make all text crisp and legible.")
+      .describe("Instructions for fixing the selected region"),
+    x: z.number().min(0).max(100).describe("Left edge of region as percentage of image width (0-100)"),
+    y: z.number().min(0).max(100).describe("Top edge of region as percentage of image height (0-100)"),
+    width: z.number().min(1).max(100).describe("Width of region as percentage of image width (1-100)"),
+    height: z.number().min(1).max(100).describe("Height of region as percentage of image height (1-100)"),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Resolution for the Gemini call on the cropped region"),
+  },
+  async ({ filename, prompt, x, y, width, height, image_size }) => {
+    try {
+      await ensureViewer();
+      log(`fix_region: source=${filename} region=(${x}%,${y}%,${width}%,${height}%)`);
+      const t0 = Date.now();
+
+      // Load source image
+      const filepath = join(SAVE_DIR, filename);
+      const srcBuf = await readFile(filepath);
+      const metadata = await sharp(srcBuf).metadata();
+      const imgW = metadata.width!;
+      const imgH = metadata.height!;
+      log(`  Source: ${imgW}x${imgH}`);
+
+      // Convert percentages to pixels
+      const pxX = Math.round((x / 100) * imgW);
+      const pxY = Math.round((y / 100) * imgH);
+      const pxW = Math.round((width / 100) * imgW);
+      const pxH = Math.round((height / 100) * imgH);
+
+      // Snap to nearest aspect ratio
+      const snapped = snapToAspectRatio(pxX, pxY, pxW, pxH, imgW, imgH);
+      log(`  Requested: ${pxW}x${pxH} at (${pxX},${pxY}) -> Snapped: ${snapped.width}x${snapped.height} at (${snapped.left},${snapped.top}) [${snapped.aspectLabel}]`);
+
+      // Extract the region
+      const regionBuf = await sharp(srcBuf)
+        .extract({ left: snapped.left, top: snapped.top, width: snapped.width, height: snapped.height })
+        .png()
+        .toBuffer();
+
+      // Compress for Gemini if needed
+      let sendBuf: Buffer;
+      let sendMime: string;
+      if (snapped.width > 1024 || regionBuf.length > 500_000) {
+        sendBuf = await sharp(regionBuf).resize(Math.min(snapped.width, 1024)).jpeg({ quality: 85 }).toBuffer();
+        sendMime = "image/jpeg";
+      } else {
+        sendBuf = regionBuf;
+        sendMime = "image/png";
+      }
+
+      // Send to Gemini
+      const { imageBase64 } = await callGemini(
+        [
+          { text: prompt },
+          { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
+        ],
+        snapped.aspectLabel,
+        image_size
+      );
+
+      // Resize fixed region back to exact pixel dimensions of the snapped crop
+      let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
+        .resize(snapped.width, snapped.height, { fit: "fill" })
+        .png()
+        .toBuffer();
+
+      // Match brightness/contrast to original region
+      fixedRegion = await matchHistogram(fixedRegion, regionBuf);
+
+      // Composite back into original image
+      const finalBuf = await sharp(srcBuf)
+        .composite([{ input: fixedRegion, left: snapped.left, top: snapped.top }])
+        .png()
+        .toBuffer();
+
+      // Save result
+      const id = randomUUID();
+      const outFilename = await saveToDisk(finalBuf, `fixreg_${id.slice(0, 8)}`);
+      log(`  Composited fixed region -> ${outFilename}`);
+
+      const img: StoredImage = {
+        id,
+        prompt: `[fix-region ${x}%,${y}% ${width}%x${height}%] ${prompt.slice(0, 50)}`,
+        fullPng: finalBuf,
+        timestamp: Date.now(),
+        filename: outFilename,
+      };
+      imageStore.push(img);
+      notifyViewerClients(img);
+
+      const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(finalBuf);
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+      log(`fix_region complete in ${elapsed}s`);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Region snapped from ${pxW}x${pxH} to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})`,
+          },
+          { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
+          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`fix_region error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `fix_region failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "interactive_fix",
+  `Opens an image in a browser-based crop tool where the user can draw a rectangle around the region to fix, add notes/instructions, and submit. The tool waits for the user's selection, then sends the cropped region to Gemini for repair and composites it back into the original image. Best for precise, user-guided fixes.`,
+  {
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    image_size: z
+      .enum(["512", "1K", "2K"])
+      .default("1K")
+      .describe("Resolution for the Gemini call on the cropped region"),
+  },
+  async ({ filename, image_size }) => {
+    let completeResolve!: (val: CropResult) => void;
+    try {
+      await ensureViewer();
+      log(`interactive_fix: opening crop UI for ${filename}`);
+
+      // Open crop UI in browser
+      const cropUrl = `http://localhost:${viewerPort}/crop/${encodeURIComponent(filename)}`;
+      log(`  Opening crop URL: ${cropUrl}`);
+      const { execFile } = await import("child_process");
+      execFile("open", [cropUrl]);
+
+      // Wait for the user to submit a crop selection
+      log(`  Waiting for user to select region in browser...`);
+      const onComplete = new Promise<CropResult>((r) => { completeResolve = r; });
+      const submission = await new Promise<CropSubmission>((resolve) => {
+        pendingCrops.set(filename, { resolve, onComplete, completeResolve });
+      });
+
+      log(`  User submitted: region=(${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}%,${submission.width.toFixed(1)}%,${submission.height.toFixed(1)}%) prompt="${submission.prompt.slice(0, 80)}"`);
+
+      // Load source image
+      const filepath = join(SAVE_DIR, filename);
+      const srcBuf = await readFile(filepath);
+      const metadata = await sharp(srcBuf).metadata();
+      const imgW = metadata.width!;
+      const imgH = metadata.height!;
+
+      // Convert percentages to pixels
+      const pxX = Math.round((submission.x / 100) * imgW);
+      const pxY = Math.round((submission.y / 100) * imgH);
+      const pxW = Math.round((submission.width / 100) * imgW);
+      const pxH = Math.round((submission.height / 100) * imgH);
+
+      // Snap to nearest aspect ratio
+      const snapped = snapToAspectRatio(pxX, pxY, pxW, pxH, imgW, imgH);
+      log(`  Snapped: ${snapped.width}x${snapped.height} at (${snapped.left},${snapped.top}) [${snapped.aspectLabel}]`);
+
+      // Extract the region
+      const regionBuf = await sharp(srcBuf)
+        .extract({ left: snapped.left, top: snapped.top, width: snapped.width, height: snapped.height })
+        .png()
+        .toBuffer();
+
+      // Compress for Gemini if needed
+      let sendBuf: Buffer;
+      let sendMime: string;
+      if (snapped.width > 1024 || regionBuf.length > 500_000) {
+        sendBuf = await sharp(regionBuf).resize(Math.min(snapped.width, 1024)).jpeg({ quality: 85 }).toBuffer();
+        sendMime = "image/jpeg";
+      } else {
+        sendBuf = regionBuf;
+        sendMime = "image/png";
+      }
+
+      const prompt = submission.prompt || "Clean up and fix any garbled, glitched, or distorted text. Preserve the style, colors, and layout exactly.";
+
+      // Send to Gemini
+      const { imageBase64 } = await callGemini(
+        [
+          { text: prompt },
+          { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
+        ],
+        snapped.aspectLabel,
+        image_size
+      );
+
+      // Resize fixed region back to exact pixel dimensions
+      let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
+        .resize(snapped.width, snapped.height, { fit: "fill" })
+        .png()
+        .toBuffer();
+
+      // Match brightness/contrast to original region
+      fixedRegion = await matchHistogram(fixedRegion, regionBuf);
+
+      // Composite back into original
+      const finalBuf = await sharp(srcBuf)
+        .composite([{ input: fixedRegion, left: snapped.left, top: snapped.top }])
+        .png()
+        .toBuffer();
+
+      // Save result
+      const id = randomUUID();
+      const outFilename = await saveToDisk(finalBuf, `ifix_${id.slice(0, 8)}`);
+      log(`  Composited fixed region -> ${outFilename}`);
+
+      const img: StoredImage = {
+        id,
+        prompt: `[interactive-fix] ${prompt.slice(0, 60)}`,
+        fullPng: finalBuf,
+        timestamp: Date.now(),
+        filename: outFilename,
+      };
+      imageStore.push(img);
+      notifyViewerClients(img);
+
+      const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(finalBuf);
+
+      // Notify the browser that processing is complete
+      completeResolve({ ok: true, filename: outFilename });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `User selected region: ${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}% ${submission.width.toFixed(1)}%x${submission.height.toFixed(1)}% -> snapped to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})\nUser notes: ${submission.prompt || "(none)"}`,
+          },
+          { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
+          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`interactive_fix error: ${msg}`);
+      // Notify the browser of failure too
+      completeResolve?.({ ok: false, error: msg });
+      return {
+        content: [{ type: "text" as const, text: `interactive_fix failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Startup ---
+
+let viewerStarted = false;
+
+async function ensureViewer() {
+  if (viewerStarted) return;
+  viewerStarted = true;
+  viewerPort = await startViewer();
+  log(`Viewer running at http://localhost:${viewerPort}`);
+  const { exec } = await import("child_process");
+  exec(`open http://localhost:${viewerPort}`);
+}
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  log("MCP server running on stdio");
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
