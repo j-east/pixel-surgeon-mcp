@@ -1894,6 +1894,84 @@ server.tool(
   }
 );
 
+server.tool(
+  "remove_background",
+  `Remove white (or near-white) background from an image and make it transparent. Outputs a PNG with alpha channel. The image must already exist in ${SAVE_DIR} (use save_image to import first).`,
+  {
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    threshold: z
+      .number()
+      .min(0)
+      .max(255)
+      .default(30)
+      .describe(
+        "How far from pure white a pixel can be and still count as background (0 = exact white only, 30 = default, higher = more aggressive)"
+      ),
+  },
+  async ({ filename, threshold }) => {
+    try {
+      const srcPath = join(SAVE_DIR, filename);
+      const { data, info } = await sharp(srcPath)
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      const channels = info.channels; // 4 (RGBA)
+      for (let i = 0; i < data.length; i += channels) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        if (r >= 255 - threshold && g >= 255 - threshold && b >= 255 - threshold) {
+          data[i + 3] = 0; // set alpha to 0
+        }
+      }
+
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const outFilename = `${ts}_nobg.png`;
+      const outPath = join(SAVE_DIR, outFilename);
+
+      await sharp(data, {
+        raw: { width: info.width, height: info.height, channels: 4 },
+      })
+        .png()
+        .toFile(outPath);
+
+      const s = await stat(outPath);
+      log(`remove_background: ${filename} -> ${outFilename} (${(s.size / 1024).toFixed(0)}KB, threshold=${threshold})`);
+
+      // Register in viewer
+      await ensureViewer();
+      const fullPng = await readFile(outPath);
+      const id = randomUUID();
+      const img: StoredImage = {
+        id,
+        prompt: `remove_background(${filename}, threshold=${threshold})`,
+        fullPng,
+        timestamp: Date.now(),
+        filename: outFilename,
+      };
+      imageStore.push(img);
+      notifyViewerClients(img);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Background removed! Saved as ${outFilename} (${(s.size / 1024).toFixed(0)}KB). View full-res at http://localhost:${viewerPort}`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`remove_background error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `remove_background failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // --- Startup ---
 
 let viewerStarted = false;
