@@ -15,8 +15,11 @@ Google's image gen pipeline ("nanobanana2"):
 
 Flash chokes on text-heavy images. The fix tools exploit this by sending smaller regions.
 
-## Tools (8)
+Video generation uses Veo 3 (async API with polling). Supports 16:9 and 9:16, 5s or 8s duration. Generates both video and ambient audio.
+
+## Tools (9)
 - `generate_image` / `generate_images` — text-to-image (single / parallel batch)
+- `generate_video` — text-to-video via Veo 3 (async polling, 1-3 min, generates audio)
 - `edit_image` — edit existing image with instructions
 - `list_images` / `save_image` — file management
 - `fix_image` — grid-based tile repair (2x2, 3x3, etc.)

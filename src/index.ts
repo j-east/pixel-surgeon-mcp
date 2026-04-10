@@ -15,6 +15,12 @@ const API_KEY = process.env.GOOGLE_API_KEY!;
 const MODEL = "gemini-3.1-flash-image-preview";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
+const VEO_MODEL = "veo-3.1-generate-preview";
+const VEO_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const VEO_ENDPOINT = `${VEO_BASE}/models/${VEO_MODEL}:predictLongRunning`;
+const VEO_POLL_INTERVAL = 10_000; // 10 seconds
+const VEO_MAX_POLLS = 60; // 10 minutes max
+
 const MAX_MCP_BYTES = 950_000;
 
 function log(msg: string) {
@@ -29,9 +35,23 @@ interface StoredImage {
   fullPng: Buffer;
   timestamp: number;
   filename: string;
+  aspectRatio?: string;
+  imageSize?: string;
 }
 
 const imageStore: StoredImage[] = [];
+
+interface StoredVideo {
+  id: string;
+  prompt: string;
+  filename: string;
+  timestamp: number;
+  aspectRatio: string;
+  durationSeconds: number;
+}
+
+const videoStore: StoredVideo[] = [];
+
 let viewerPort: number | null = null;
 const sseClients = new Set<ServerResponse>();
 
@@ -65,7 +85,14 @@ const pendingCrops = new Map<string, {
 }>();
 
 function notifyViewerClients(img: StoredImage) {
-  const event = JSON.stringify({ id: img.id, prompt: img.prompt });
+  const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image" });
+  for (const client of sseClients) {
+    client.write(`data: ${event}\n\n`);
+  }
+}
+
+function notifyViewerClientsVideo(vid: StoredVideo) {
+  const event = JSON.stringify({ id: vid.id, prompt: vid.prompt, type: "video", filename: vid.filename });
   for (const client of sseClients) {
     client.write(`data: ${event}\n\n`);
   }
@@ -101,6 +128,26 @@ function startViewer(): Promise<number> {
             const ext = extname(fname).toLowerCase();
             const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
             res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" });
+            res.end(buf);
+          })
+          .catch(() => {
+            res.writeHead(404);
+            res.end("Not found");
+          });
+        return;
+      }
+
+      // Serve video files by filename
+      if (url.pathname.startsWith("/video/")) {
+        const fname = decodeURIComponent(url.pathname.slice(7));
+        const fpath = join(SAVE_DIR, fname);
+        readFile(fpath)
+          .then((buf) => {
+            res.writeHead(200, {
+              "Content-Type": "video/mp4",
+              "Content-Length": buf.length.toString(),
+              "Cache-Control": "public, max-age=31536000, immutable",
+            });
             res.end(buf);
           })
           .catch(() => {
@@ -179,6 +226,38 @@ function startViewer(): Promise<number> {
         return;
       }
 
+      // Respin endpoint — regenerate an image with the same prompt
+      if (url.pathname === "/respin" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+        req.on("end", async () => {
+          try {
+            const { id, prompt: customPrompt } = JSON.parse(body);
+            const source = imageStore.find((i) => i.id === id);
+            if (!source) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Image not found" }));
+              return;
+            }
+            const finalPrompt = (customPrompt && customPrompt.trim()) ? customPrompt.trim() : source.prompt;
+            log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${source.imageSize ?? "1K"}, ${source.aspectRatio ?? "1:1"})`);
+            const result = await generateAndStore(
+              finalPrompt,
+              source.aspectRatio ?? "1:1",
+              source.imageSize ?? "1K"
+            );
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, id: imageStore[imageStore.length - 1].id, filename: result.filename }));
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`respin error: ${msg}`);
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: msg }));
+          }
+        });
+        return;
+      }
+
       if (url.pathname === "/events") {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -207,15 +286,34 @@ function startViewer(): Promise<number> {
 }
 
 function viewerHtml(): string {
-  const images = [...imageStore].reverse();
-  const imgTags = images
-    .map(
-      (img) =>
-        `<div class="img-entry" id="img-${img.id}">
-          <p>${esc(img.prompt)}</p>
+  // Merge images and videos, sorted by timestamp descending
+  type GalleryItem = { type: "image"; data: StoredImage } | { type: "video"; data: StoredVideo };
+  const items: GalleryItem[] = [
+    ...imageStore.map((i) => ({ type: "image" as const, data: i })),
+    ...videoStore.map((v) => ({ type: "video" as const, data: v })),
+  ].sort((a, b) => b.data.timestamp - a.data.timestamp);
+
+  const itemTags = items
+    .map((item) => {
+      if (item.type === "video") {
+        const vid = item.data;
+        return `<div class="img-entry" id="vid-${vid.id}">
+          <div class="prompt-row">
+            <textarea class="prompt-edit" readonly>${esc(vid.prompt)}</textarea>
+            <span class="video-badge">VIDEO</span>
+          </div>
+          <video src="/video/${encodeURIComponent(vid.filename)}" controls loop playsinline style="max-width:100%;"></video>
+        </div>`;
+      }
+      const img = item.data;
+      return `<div class="img-entry" id="img-${img.id}">
+          <div class="prompt-row">
+            <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
+            <button class="respin-btn" onclick="respin('${img.id}', this)" title="Regenerate (edit prompt above to change)">&#x21bb; Respin</button>
+          </div>
           <img src="/img/${img.id}" />
-        </div>`
-    )
+        </div>`;
+    })
     .join("\n");
 
   return `<!DOCTYPE html>
@@ -223,33 +321,93 @@ function viewerHtml(): string {
 <style>
   body { margin: 20px; background: #1a1a1a; color: #ccc; font-family: system-ui; }
   img { max-width: 100%; }
+  video { max-width: 100%; border-radius: 4px; }
   div.img-entry { margin-bottom: 24px; }
   p { margin: 0 0 8px 0; font-size: 14px; color: #999; }
-  #empty { display: ${images.length === 0 ? "block" : "none"}; }
+  #empty { display: ${items.length === 0 ? "block" : "none"}; }
   #open-folder { background: #333; color: #ccc; border: 1px solid #555; padding: 8px 16px; cursor: pointer; font-size: 14px; font-family: system-ui; margin-bottom: 20px; }
   #open-folder:hover { background: #444; }
+  .prompt-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
+  .prompt-edit { flex: 1; background: #252525; color: #bbb; border: 1px solid #444; padding: 8px; font-size: 13px; font-family: system-ui; border-radius: 4px; resize: vertical; min-height: 48px; line-height: 1.4; }
+  .prompt-edit:focus { border-color: #3a6a9b; color: #ddd; outline: none; }
+  .respin-btn { background: #2a4a6b; color: #8bc4ff; border: 1px solid #3a6a9b; padding: 8px 16px; cursor: pointer; font-size: 13px; font-family: system-ui; border-radius: 4px; transition: all 0.15s; white-space: nowrap; align-self: flex-start; }
+  .respin-btn:hover { background: #3a6a9b; color: #fff; }
+  .respin-btn:disabled { opacity: 0.5; cursor: wait; }
+  .video-badge { background: #6b2a2a; color: #ff8b8b; border: 1px solid #9b3a3a; padding: 8px 16px; font-size: 11px; font-family: system-ui; border-radius: 4px; white-space: nowrap; align-self: flex-start; font-weight: 600; letter-spacing: 0.5px; }
 </style></head><body>
 <button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
 <p id="empty">Waiting for images...</p>
-<div id="gallery">${imgTags}</div>
+<div id="gallery">${itemTags}</div>
 <script>
 const gallery = document.getElementById("gallery");
 const empty = document.getElementById("empty");
 const es = new EventSource("/events");
 es.onmessage = (e) => {
-  const { id, prompt } = JSON.parse(e.data);
+  const data = JSON.parse(e.data);
+  const { id, prompt, type, filename } = data;
   empty.style.display = "none";
   const div = document.createElement("div");
   div.className = "img-entry";
-  div.id = "img-" + id;
-  const p = document.createElement("p");
-  p.textContent = prompt;
-  const img = document.createElement("img");
-  img.src = "/img/" + id;
-  div.appendChild(p);
-  div.appendChild(img);
+
+  if (type === "video") {
+    div.id = "vid-" + id;
+    const row = document.createElement("div");
+    row.className = "prompt-row";
+    const ta = document.createElement("textarea");
+    ta.className = "prompt-edit";
+    ta.readOnly = true;
+    ta.value = prompt;
+    const badge = document.createElement("span");
+    badge.className = "video-badge";
+    badge.textContent = "VIDEO";
+    row.appendChild(ta);
+    row.appendChild(badge);
+    const vid = document.createElement("video");
+    vid.src = "/video/" + encodeURIComponent(filename);
+    vid.controls = true;
+    vid.loop = true;
+    vid.playsInline = true;
+    vid.style.maxWidth = "100%";
+    div.appendChild(row);
+    div.appendChild(vid);
+  } else {
+    div.id = "img-" + id;
+    const row = document.createElement("div");
+    row.className = "prompt-row";
+    const ta = document.createElement("textarea");
+    ta.className = "prompt-edit";
+    ta.dataset.id = id;
+    ta.value = prompt;
+    const btn = document.createElement("button");
+    btn.className = "respin-btn";
+    btn.innerHTML = "&#x21bb; Respin";
+    btn.title = "Regenerate (edit prompt above to change)";
+    btn.onclick = function() { respin(id, this); };
+    row.appendChild(ta);
+    row.appendChild(btn);
+    const img = document.createElement("img");
+    img.src = "/img/" + id;
+    div.appendChild(row);
+    div.appendChild(img);
+  }
   gallery.prepend(div);
 };
+async function respin(id, btn) {
+  btn.disabled = true;
+  btn.textContent = "Generating...";
+  const ta = document.querySelector('textarea[data-id="' + id + '"]');
+  const prompt = ta ? ta.value : undefined;
+  try {
+    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, prompt }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Respin failed");
+    btn.textContent = "\u21bb Respin";
+    btn.disabled = false;
+  } catch (err) {
+    btn.textContent = "Failed — retry?";
+    btn.disabled = false;
+  }
+}
 </script>
 </body></html>`;
 }
@@ -687,6 +845,107 @@ async function callGemini(
   return { imageBase64, text };
 }
 
+// --- Veo API ---
+
+async function callVeo(
+  prompt: string,
+  aspectRatio: string,
+  durationSeconds: number
+): Promise<Buffer> {
+  const t0 = Date.now();
+  log(`  Calling Veo API (${VEO_MODEL}, ${aspectRatio}, ${durationSeconds}s)...`);
+
+  let res: Response;
+  try {
+    res = await fetch(`${VEO_ENDPOINT}?key=${API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instances: [{ prompt }],
+        parameters: {
+          aspectRatio,
+          durationSeconds,
+          personGeneration: "allow_all",
+          sampleCount: 1,
+          resolution: "720p",
+        },
+      }),
+    });
+  } catch (fetchErr: unknown) {
+    throw new Error(
+      `Network error calling Veo API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`
+    );
+  }
+
+  const rawBody = await res.text();
+  let operation: { name?: string; done?: boolean; error?: { message: string }; response?: unknown };
+  try {
+    operation = JSON.parse(rawBody);
+  } catch {
+    throw new Error(`Veo API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+  }
+
+  if (!res.ok || operation.error) {
+    throw new Error(`Veo API HTTP ${res.status}: ${operation.error?.message ?? rawBody.slice(0, 2000)}`);
+  }
+
+  if (!operation.name) {
+    throw new Error(`Veo API returned no operation name. Response: ${rawBody.slice(0, 2000)}`);
+  }
+
+  log(`  Veo operation started: ${operation.name}`);
+
+  // Poll for completion
+  const pollUrl = `${VEO_BASE}/${operation.name}?key=${API_KEY}`;
+  for (let i = 0; i < VEO_MAX_POLLS; i++) {
+    await new Promise((r) => setTimeout(r, VEO_POLL_INTERVAL));
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+    log(`  Polling Veo (${elapsed}s elapsed, attempt ${i + 1}/${VEO_MAX_POLLS})...`);
+
+    const pollRes = await fetch(pollUrl);
+    const pollBody = await pollRes.text();
+    let pollData: {
+      done?: boolean;
+      error?: { message: string };
+      response?: {
+        generateVideoResponse?: {
+          generatedSamples?: Array<{ video?: { uri?: string } }>;
+        };
+      };
+    };
+    try {
+      pollData = JSON.parse(pollBody);
+    } catch {
+      log(`  Poll returned non-JSON, retrying...`);
+      continue;
+    }
+
+    if (pollData.error) {
+      throw new Error(`Veo generation failed: ${pollData.error.message}`);
+    }
+
+    if (pollData.done) {
+      const videoUri = pollData.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri;
+      if (!videoUri) {
+        throw new Error(`Veo completed but no video URI found. Response: ${pollBody.slice(0, 2000)}`);
+      }
+
+      log(`  Veo complete in ${((Date.now() - t0) / 1000).toFixed(1)}s, downloading video...`);
+
+      // Download the video — append API key
+      const downloadRes = await fetch(`${videoUri}&key=${API_KEY}`, { redirect: "follow" });
+      if (!downloadRes.ok) {
+        throw new Error(`Failed to download video (HTTP ${downloadRes.status})`);
+      }
+      const videoBuffer = Buffer.from(await downloadRes.arrayBuffer());
+      log(`  Downloaded video: ${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB`);
+      return videoBuffer;
+    }
+  }
+
+  throw new Error(`Veo generation timed out after ${VEO_MAX_POLLS * VEO_POLL_INTERVAL / 1000}s`);
+}
+
 /** Generate, store, return shrunk for MCP */
 async function generateAndStore(
   prompt: string,
@@ -700,7 +959,7 @@ async function generateAndStore(
   const filename = await saveToDisk(fullPng, id.slice(0, 8));
   log(`  Saved ${filename}`);
 
-  const img: StoredImage = { id, prompt, fullPng, timestamp: Date.now(), filename };
+  const img: StoredImage = { id, prompt, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize };
   imageStore.push(img);
   notifyViewerClients(img);
 
@@ -756,9 +1015,17 @@ const STYLE_PRESETS: Record<string, { description: string; promptPrefix: string;
     promptPrefix: "Geometric dithered illustration style. All shading done through dithering patterns, halftone dots, and geometric cross-hatch grids — NO smooth gradients anywhere. Every surface rendered with visible pixel-level dithering like a 16-color EGA/VGA palette pushed through ordered Bayer matrix dithering. Fractal geometric patterns in the background — Sierpinski triangles, hexagonal tessellations, recursive diamond grids. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a), warm muted greens (#5a8a5c). Subjects built from clean geometric shapes — triangular facets, polygonal planes, like a low-poly render but flat and 2D with dithered color fills instead of smooth shading. Think: Saul Bass designed a character select screen for an Amiga game. Geometric line-art icons. Chunky retrofuturist typeface for headers, smaller geometric caps for subtitles. Horizontal scanline overlay. No photorealism, no soft shadows, no AI-gradient smoothness. Every color transition is a hard dither pattern. Clean, precise, geometric, but retro-cool.",
     defaultAspectRatio: "4:5",
   },
+  "clean-tech-infographic": {
+    description: "Clean technical infographic for architecture diagrams, system flows, and data pipelines. Dark navy background, cyan/electric blue glowing connection lines, geometric nodes, professional and precise.",
+    promptPrefix: "Clean, professional technical infographic on a dark navy (#0a1628) background with subtle grid lines. Use cyan (#00d4ff) and electric blue (#4a9eff) glowing connection lines between components. White and light gray text only — no bright colors for text. Components rendered as clean geometric shapes: rounded rectangles, hexagons, circles with thin borders and subtle inner glow. Icons are minimal line-art style (server racks, phones, browsers, databases, cloud services). Typography: modern sans-serif (like Inter or SF Pro) — bold for titles, regular weight for labels, monospace for technical details (ports, protocols, versions). Layout follows clear left-to-right or top-to-bottom data flow with labeled arrows showing protocols and data formats. No decorative illustrations, no clip art, no logos, no random embellishments. Include a thin tech stack bar at the bottom. The overall feel is a polished engineering diagram you'd present to a CTO — precise, minimal, and authoritative.",
+    defaultAspectRatio: "16:9",
+  },
 };
 
 const STYLE_KEYS = Object.keys(STYLE_PRESETS) as [string, ...string[]];
+
+const STYLE_DESCRIPTION = "Optional style preset to apply. When set, the style's prompt prefix is prepended and its default aspect ratio is used (unless you explicitly set one).\n\nAvailable styles:\n" +
+  Object.entries(STYLE_PRESETS).map(([key, val]) => `• ${key} — ${val.description}`).join("\n");
 
 function applyStyle(prompt: string, style?: string): string {
   if (!style || !STYLE_PRESETS[style]) return prompt;
@@ -780,29 +1047,33 @@ const server = new McpServer(
 
 server.tool(
   "list_images",
-  `List image files in the shared nanobanana2 directory (${SAVE_DIR}). Use this to find images available for editing.`,
+  `List image and video files in the shared nanobanana2 directory (${SAVE_DIR}). Use this to find images available for editing.`,
   {},
   async () => {
     try {
       await ensureSaveDir();
       const files = await readdir(SAVE_DIR);
-      const imageFiles = files.filter((f) =>
-        /\.(png|jpg|jpeg|webp)$/i.test(f)
+      const mediaFiles = files.filter((f) =>
+        /\.(png|jpg|jpeg|webp|mp4)$/i.test(f)
       );
-      imageFiles.sort().reverse(); // newest first
+      mediaFiles.sort().reverse(); // newest first
 
       const entries = [];
-      for (const f of imageFiles.slice(0, 50)) {
+      for (const f of mediaFiles.slice(0, 50)) {
         const s = await stat(join(SAVE_DIR, f));
-        entries.push(`${f} (${(s.size / 1024).toFixed(0)}KB)`);
+        const isVideo = /\.mp4$/i.test(f);
+        const sizeStr = isVideo
+          ? `${(s.size / 1024 / 1024).toFixed(1)}MB`
+          : `${(s.size / 1024).toFixed(0)}KB`;
+        entries.push(`${isVideo ? "[VIDEO] " : ""}${f} (${sizeStr})`);
       }
 
       return {
         content: [{
           type: "text" as const,
           text: entries.length > 0
-            ? `Images in ${SAVE_DIR}:\n${entries.join("\n")}`
-            : `No images in ${SAVE_DIR}`,
+            ? `Files in ${SAVE_DIR}:\n${entries.join("\n")}`
+            : `No files in ${SAVE_DIR}`,
         }],
       };
     } catch (err: unknown) {
@@ -870,7 +1141,7 @@ server.tool(
     style: z
       .enum(STYLE_KEYS)
       .optional()
-      .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended to each prompt and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+      .describe(STYLE_DESCRIPTION),
   },
   async ({ prompts, aspect_ratio, image_size, style }) => {
     try {
@@ -951,7 +1222,7 @@ server.tool(
     style: z
       .enum(STYLE_KEYS)
       .optional()
-      .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+      .describe(STYLE_DESCRIPTION),
   },
   async ({ prompt, aspect_ratio, image_size, style }) => {
     try {
@@ -984,6 +1255,58 @@ server.tool(
 );
 
 server.tool(
+  "generate_video",
+  "Generate a video using Google's Veo 3. Returns an MP4 video file. Video generation takes 1-3 minutes — the tool will poll until complete. Veo 3 generates both video and ambient audio. Videos are saved to the shared directory and viewable in the browser viewer.",
+  {
+    prompt: z.string().describe("Text prompt describing the video to generate. Be descriptive about motion, camera angles, lighting, and scene details for best results."),
+    aspect_ratio: z
+      .enum(["16:9", "9:16"])
+      .default("16:9")
+      .describe("Aspect ratio — 16:9 for landscape, 9:16 for portrait/vertical"),
+    duration: z
+      .enum(["5", "8"])
+      .default("8")
+      .describe("Video duration in seconds"),
+  },
+  async ({ prompt, aspect_ratio, duration }) => {
+    try {
+      await ensureViewer();
+      const durationSeconds = parseInt(duration, 10);
+      log(`generate_video: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" (${aspect_ratio}, ${durationSeconds}s)`);
+      const t0 = Date.now();
+
+      const videoBuffer = await callVeo(prompt, aspect_ratio, durationSeconds);
+
+      const id = randomUUID();
+      const filename = await saveToDisk(videoBuffer, id.slice(0, 8), ".mp4");
+      log(`  Saved video ${filename} (${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB)`);
+
+      const vid: StoredVideo = { id, prompt, filename, timestamp: Date.now(), aspectRatio: aspect_ratio, durationSeconds };
+      videoStore.push(vid);
+      notifyViewerClientsVideo(vid);
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      log(`generate_video complete in ${elapsed}s`);
+
+      return {
+        content: [
+          { type: "text" as const, text: `Video generated successfully in ${elapsed}s` },
+          { type: "text" as const, text: `Saved as ${filename} in ${SAVE_DIR} (${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB)` },
+          { type: "text" as const, text: `Viewable at http://localhost:${viewerPort}` },
+        ],
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`generate_video error: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `generate_video failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
   "edit_image",
   `Edit an existing image using Google's Nanobanana2 (Gemini 3.1 Flash Image). Provide the filename of an image in ${SAVE_DIR} (use list_images to see available files, or save_image to import one first). The MCP reads the file directly — do NOT pass base64 image data.`,
   {
@@ -1000,7 +1323,7 @@ server.tool(
     style: z
       .enum(STYLE_KEYS)
       .optional()
-      .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+      .describe(STYLE_DESCRIPTION),
   },
   async ({ prompt, filename, aspect_ratio, image_size, style }) => {
     try {
