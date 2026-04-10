@@ -49,12 +49,25 @@ Flash struggles with text-heavy images. The fix tools solve this by sending smal
 
 All generation and edit tools support an optional `style` parameter:
 
-| Preset | Vibe | Palette |
-|--------|------|---------|
-| `neo-brutalist` | Magazine editorial, bold typography, halftone textures | Cream, black, terracotta |
-| `neo-retro-futurism` | 1960s Space Age meets 1980s arcade | Cathode blue, amber, salmon |
-| `fractal-arcade` | Dithered fractals, Sierpinski patterns, low-poly | CRT retro, Amiga/EGA |
-| `clean-tech-infographic` | Technical diagrams, system flows, data pipelines | Dark navy, cyan, electric blue |
+### `neo-brutalist`
+Magazine editorial, bold typography, halftone textures. Cream, black, and terracotta palette.
+
+<img src="assets/style-neo-brutalist.png" alt="neo-brutalist style example" width="400" />
+
+### `neo-retro-futurism`
+1960s Space Age meets 1980s arcade. Cathode blue, amber, and salmon palette.
+
+<img src="assets/style-neo-retro-futurism.png" alt="neo-retro-futurism style example" width="400" />
+
+### `fractal-arcade`
+Dithered fractals, Sierpinski patterns, low-poly. CRT retro, Amiga/EGA palette.
+
+<img src="assets/style-fractal-arcade.png" alt="fractal-arcade style example" width="400" />
+
+### `clean-tech-infographic`
+Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric blue.
+
+<img src="assets/style-clean-tech-infographic.png" alt="clean-tech-infographic style example" width="600" />
 
 ## Setup
 
