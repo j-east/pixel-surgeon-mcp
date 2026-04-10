@@ -109,6 +109,22 @@ npm run start  # run compiled server
 - **Human-in-the-loop** — `interactive_fix` opens a browser crop UI, blocks via Promise until the user submits, fires parallel Gemini calls, and lets the user pick the best result
 - **MCP size limits** — full-resolution images are saved to disk; downsampled versions (< 950KB) are returned in MCP responses
 
+## Contributing
+
+PRs are welcome! We're especially looking for:
+
+### New style presets
+
+Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should include:
+
+- The preset definition (name, prompt prefix, default aspect ratio)
+- 2-3 example images generated with the preset (drop them in your PR description)
+- A short description of the visual style for the README table
+
+### Model adapters
+
+Currently nanobanana2 is wired to Gemini 3.1 Flash Image and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, DALL-E, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
+
 ## License
 
 MIT
