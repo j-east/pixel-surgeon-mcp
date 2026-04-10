@@ -19,6 +19,7 @@ function log(msg) {
 const imageStore = [];
 let viewerPort = null;
 const sseClients = new Set();
+const pendingSelections = new Map();
 const pendingCrops = new Map();
 function notifyViewerClients(img) {
     const event = JSON.stringify({ id: img.id, prompt: img.prompt });
@@ -76,11 +77,11 @@ function startViewer() {
                 req.on("end", async () => {
                     try {
                         const data = JSON.parse(body);
-                        const { filename, x, y, width, height, prompt } = data;
+                        const { filename, x, y, width, height, prompt, shots } = data;
                         const pending = pendingCrops.get(filename);
                         if (pending) {
                             // Resolve the MCP tool's await with the crop data
-                            pending.resolve({ x, y, width, height, prompt: prompt || "" });
+                            pending.resolve({ x, y, width, height, prompt: prompt || "", shots: Math.max(1, Math.min(5, shots || 1)) });
                             // Hold this HTTP response open until Gemini processing completes
                             const result = await pending.onComplete;
                             res.writeHead(200, { "Content-Type": "application/json" });
@@ -89,6 +90,33 @@ function startViewer() {
                         else {
                             res.writeHead(404, { "Content-Type": "application/json" });
                             res.end(JSON.stringify({ error: "No pending crop for this filename" }));
+                        }
+                    }
+                    catch {
+                        res.writeHead(400, { "Content-Type": "application/json" });
+                        res.end(JSON.stringify({ error: "Invalid JSON" }));
+                    }
+                });
+                return;
+            }
+            // Selection endpoint — user picks their preferred shot
+            if (url.pathname === "/crop-select" && req.method === "POST") {
+                let body = "";
+                req.on("data", (chunk) => { body += chunk.toString(); });
+                req.on("end", () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const { filename, selectedIndex } = data;
+                        const pending = pendingSelections.get(filename);
+                        if (pending) {
+                            pending.resolve(selectedIndex);
+                            pendingSelections.delete(filename);
+                            res.writeHead(200, { "Content-Type": "application/json" });
+                            res.end(JSON.stringify({ ok: true, filename: pending.filenames[selectedIndex] }));
+                        }
+                        else {
+                            res.writeHead(404, { "Content-Type": "application/json" });
+                            res.end(JSON.stringify({ error: "No pending selection for this filename" }));
                         }
                     }
                     catch {
@@ -187,10 +215,15 @@ function cropHtml(filename) {
   .toolbar button { background: #2d7d46; color: #fff; border: none; padding: 10px 24px; border-radius: 4px; font-size: 14px; cursor: pointer; font-weight: 600; }
   .toolbar button:hover { background: #38a55a; }
   .toolbar button:disabled { background: #555; cursor: not-allowed; }
-  .canvas-wrap { flex: 1; overflow: auto; position: relative; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+  .toolbar select { background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 6px 8px; font-size: 13px; }
+  .canvas-wrap { flex: 1; overflow: auto; position: relative; display: flex; align-items: flex-start; justify-content: center; padding: 16px; flex-wrap: wrap; gap: 16px; }
   canvas { cursor: crosshair; max-width: 100%; }
   .coords { font-size: 12px; color: #666; min-width: 180px; text-align: right; }
   .status { font-size: 13px; color: #ffcc00; padding: 8px 16px; background: #1a1a1a; border-top: 1px solid #333; }
+  .results { display: flex; gap: 12px; flex-wrap: wrap; width: 100%; }
+  .results img { max-width: 48%; border: 2px solid transparent; border-radius: 4px; cursor: pointer; }
+  .results img:hover { border-color: #4caf50; }
+  .results img.selected { border-color: #4caf50; box-shadow: 0 0 12px rgba(76,175,80,0.5); }
   .status.done { color: #4caf50; }
   .status.error { color: #f44336; }
 </style></head><body>
@@ -198,6 +231,14 @@ function cropHtml(filename) {
   <h2>Select region to fix</h2>
   <label>Notes / instructions:</label>
   <textarea id="prompt" placeholder="e.g. '36GB should be 96GB', 'fix the garbled text in this section'">Clean up and fix any garbled, glitched, or distorted text. Preserve style, colors, and layout.</textarea>
+  <label>Shots:</label>
+  <select id="shots">
+    <option value="1">1</option>
+    <option value="2">2</option>
+    <option value="3" selected>3</option>
+    <option value="4">4</option>
+    <option value="5">5</option>
+  </select>
   <button id="submit" disabled>Submit Region</button>
   <div class="coords" id="coords">Draw a rectangle on the image</div>
 </div>
@@ -314,8 +355,9 @@ submitBtn.addEventListener("click", async () => {
   statusEl.textContent = "Sending region to Gemini for fixing...";
   statusEl.className = "status";
 
+  const shotsVal = parseInt(document.getElementById("shots").value, 10);
   try {
-    statusEl.textContent = "Region submitted — waiting for Gemini to process...";
+    statusEl.textContent = "Region submitted — generating " + shotsVal + " shot(s) with Gemini...";
     statusEl.className = "status";
     const resp = await fetch("/crop-submit", {
       method: "POST",
@@ -327,18 +369,59 @@ submitBtn.addEventListener("click", async () => {
         width: pct.width,
         height: pct.height,
         prompt: promptEl.value,
+        shots: shotsVal,
       }),
     });
     const result = await resp.json();
     if (result.ok) {
-      statusEl.textContent = "Done! Saved as " + result.filename;
-      statusEl.className = "status done";
-      // Show the fixed image below
-      const resultImg = document.createElement("img");
-      resultImg.src = "/file/" + encodeURIComponent(result.filename);
-      resultImg.style.maxWidth = "100%";
-      resultImg.style.marginTop = "16px";
-      document.querySelector(".canvas-wrap").appendChild(resultImg);
+      if (result.filenames && result.filenames.length > 1) {
+        statusEl.textContent = result.filenames.length + " shots ready — click to select the best one, then click Use Selected";
+        statusEl.className = "status done";
+        const wrap = document.querySelector(".canvas-wrap");
+        const resultsDiv = document.createElement("div");
+        resultsDiv.className = "results";
+        let selectedIdx = 0;
+        result.filenames.forEach((fn, i) => {
+          const img = document.createElement("img");
+          img.src = "/file/" + encodeURIComponent(fn);
+          img.title = "Shot " + (i + 1) + ": " + fn;
+          if (i === 0) img.classList.add("selected");
+          img.addEventListener("click", () => {
+            resultsDiv.querySelectorAll("img").forEach(el => el.classList.remove("selected"));
+            img.classList.add("selected");
+            selectedIdx = i;
+          });
+          resultsDiv.appendChild(img);
+        });
+        wrap.appendChild(resultsDiv);
+        // Add "Use Selected" button
+        const useBtn = document.createElement("button");
+        useBtn.textContent = "Use Selected";
+        useBtn.style.cssText = "background:#2d7d46;color:#fff;border:none;padding:10px 24px;border-radius:4px;font-size:14px;cursor:pointer;font-weight:600;margin-top:12px;";
+        useBtn.addEventListener("click", async () => {
+          useBtn.disabled = true;
+          useBtn.textContent = "Confirming...";
+          const confirmResp = await fetch("/crop-select", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename, selectedIndex: selectedIdx }),
+          });
+          const confirmResult = await confirmResp.json();
+          if (confirmResult.ok) {
+            statusEl.textContent = "Selected shot " + (selectedIdx + 1) + " — saved as " + confirmResult.filename;
+            useBtn.textContent = "Done";
+          }
+        });
+        wrap.appendChild(useBtn);
+      } else {
+        statusEl.textContent = "Done! Saved as " + result.filename;
+        statusEl.className = "status done";
+        const resultImg = document.createElement("img");
+        resultImg.src = "/file/" + encodeURIComponent(result.filename);
+        resultImg.style.maxWidth = "100%";
+        resultImg.style.marginTop = "16px";
+        document.querySelector(".canvas-wrap").appendChild(resultImg);
+      }
       submitBtn.textContent = "Complete";
     } else {
       statusEl.textContent = "Error: " + (result.error || "Unknown");
@@ -1081,47 +1164,76 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
             sendMime = "image/png";
         }
         const prompt = submission.prompt || "Clean up and fix any garbled, glitched, or distorted text. Preserve the style, colors, and layout exactly.";
-        // Send to Gemini
-        const { imageBase64 } = await callGemini([
+        const shots = submission.shots || 1;
+        log(`  Firing ${shots} parallel Gemini call(s)...`);
+        // Fire N parallel Gemini calls
+        const geminiResults = await Promise.allSettled(Array.from({ length: shots }, (_, i) => callGemini([
             { text: prompt },
             { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
-        ], snapped.aspectLabel, image_size);
-        // Resize fixed region back to exact pixel dimensions
-        let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
-            .resize(snapped.width, snapped.height, { fit: "fill" })
-            .png()
-            .toBuffer();
-        // Match brightness/contrast to original region
-        fixedRegion = await matchHistogram(fixedRegion, regionBuf);
-        // Composite back into original
-        const finalBuf = await sharp(srcBuf)
-            .composite([{ input: fixedRegion, left: snapped.left, top: snapped.top }])
-            .png()
-            .toBuffer();
-        // Save result
-        const id = randomUUID();
-        const outFilename = await saveToDisk(finalBuf, `ifix_${id.slice(0, 8)}`);
-        log(`  Composited fixed region -> ${outFilename}`);
-        const img = {
-            id,
-            prompt: `[interactive-fix] ${prompt.slice(0, 60)}`,
-            fullPng: finalBuf,
-            timestamp: Date.now(),
-            filename: outFilename,
-        };
-        imageStore.push(img);
-        notifyViewerClients(img);
-        const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(finalBuf);
-        // Notify the browser that processing is complete
-        completeResolve({ ok: true, filename: outFilename });
+        ], snapped.aspectLabel, image_size).then(async ({ imageBase64 }) => {
+            // Resize, histogram match, and composite each result
+            let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
+                .resize(snapped.width, snapped.height, { fit: "fill" })
+                .png()
+                .toBuffer();
+            fixedRegion = await matchHistogram(fixedRegion, regionBuf);
+            const compositedBuf = await sharp(srcBuf)
+                .composite([{ input: fixedRegion, left: snapped.left, top: snapped.top }])
+                .png()
+                .toBuffer();
+            // Save each shot to disk
+            const shotId = randomUUID();
+            const shotFilename = await saveToDisk(compositedBuf, `ifix_${shotId.slice(0, 8)}`);
+            log(`  Shot ${i + 1}/${shots} -> ${shotFilename}`);
+            const img = {
+                id: shotId,
+                prompt: `[interactive-fix shot ${i + 1}] ${prompt.slice(0, 50)}`,
+                fullPng: compositedBuf,
+                timestamp: Date.now(),
+                filename: shotFilename,
+            };
+            imageStore.push(img);
+            notifyViewerClients(img);
+            return { filename: shotFilename, buffer: compositedBuf };
+        })));
+        const succeeded = geminiResults
+            .filter((r) => r.status === "fulfilled")
+            .map((r) => r.value);
+        if (succeeded.length === 0) {
+            const firstErr = geminiResults[0].reason?.message || "Unknown error";
+            throw new Error(`All ${shots} shots failed. First error: ${firstErr}`);
+        }
+        log(`  ${succeeded.length}/${shots} shots succeeded`);
+        let chosenFilename;
+        let chosenBuffer;
+        if (succeeded.length === 1) {
+            // Single result — use it directly
+            chosenFilename = succeeded[0].filename;
+            chosenBuffer = succeeded[0].buffer;
+            completeResolve({ ok: true, filename: chosenFilename });
+        }
+        else {
+            // Multiple results — send filenames to browser for user selection
+            const filenames = succeeded.map((s) => s.filename);
+            completeResolve({ ok: true, filenames });
+            // Wait for user to pick their favorite
+            log(`  Waiting for user to select from ${filenames.length} shots...`);
+            const selectedIndex = await new Promise((resolve) => {
+                pendingSelections.set(filename, { resolve, filenames });
+            });
+            chosenFilename = succeeded[selectedIndex].filename;
+            chosenBuffer = succeeded[selectedIndex].buffer;
+            log(`  User selected shot ${selectedIndex + 1}: ${chosenFilename}`);
+        }
+        const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(chosenBuffer);
         return {
             content: [
                 {
                     type: "text",
-                    text: `User selected region: ${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}% ${submission.width.toFixed(1)}%x${submission.height.toFixed(1)}% -> snapped to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})\nUser notes: ${submission.prompt || "(none)"}`,
+                    text: `User selected region: ${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}% ${submission.width.toFixed(1)}%x${submission.height.toFixed(1)}% -> snapped to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})\n${shots} shot(s), ${succeeded.length} succeeded. User picked: ${chosenFilename}\nUser notes: ${submission.prompt || "(none)"}`,
                 },
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
-                { type: "text", text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+                { type: "text", text: `Saved as ${chosenFilename} — full-res at http://localhost:${viewerPort}` },
             ],
         };
     }
