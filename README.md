@@ -71,10 +71,18 @@ Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric 
 
 ## Setup
 
+### Get a Google AI API key
+
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
+2. Sign in with your Google account
+3. Click **Create API Key** and copy it
+4. The key needs access to **Gemini 3.1 Flash Image** (image generation) and optionally **Veo 3** (video generation)
+
+> The free tier includes generous limits for experimentation. See [Google AI pricing](https://ai.google.dev/pricing) for details.
+
 ### Prerequisites
 
 - Node.js 18+
-- A [Google AI API key](https://aistudio.google.com/apikey) with access to Gemini and Veo models
 
 ### Install
 
