@@ -612,6 +612,37 @@ async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, image
     const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
     return { mcpBase64, mcpMimeType, text, filename };
 }
+// --- Style presets ---
+const STYLE_PRESETS = {
+    "neo-brutalist": {
+        description: "Neo-brutalist minimalist magazine editorial. Bold oversized typography, cream/black/terracotta palette, halftone textures, visible grid lines, asymmetric layout. Think Emigre meets Swiss brutalism.",
+        promptPrefix: "Neo-brutalist minimalist design. Magazine editorial style layout. Off-white / cream background with bold black typography in a heavy-weight grotesque sans-serif font, slightly overlapping and breaking the grid. Accent color: muted burnt orange or terracotta used sparingly as stripe or block elements. Raw, unpolished aesthetic — visible grid lines, asymmetric layout, oversized type that bleeds off edges. Subtle halftone texture overlay. Monospaced subtext in lowercase. No gradients, no glossy effects, no heavy saturation. Clean but edgy, restrained but bold.",
+        defaultAspectRatio: "4:5",
+    },
+    "neo-retro-futurism": {
+        description: "Neo-retro-futurism blending 1960s Space Age optimism with 1980s video game aesthetics. Cathode blue, warm amber, salmon red, warm green palette. Scanlines, pixel hints, and atomic-age geometry.",
+        promptPrefix: "Neo-retro-futurism style. Blend of 1960s Space Age futurism and 1980s video game aesthetics with a modern neo-retro sensibility. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff glowing CRT blue), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a to #ff6b6b), and warm muted greens (#5a8a5c to #8bbd7b). Dark background evoking a CRT monitor with subtle scanline texture and faint phosphor glow. Typography: mix of retrofuturist geometric sans-serif (like Eurostile, Microgramma, or Bank Gothic) with pixel-grid or bitmap-style secondary text. Design elements: atomic-age starbursts, orbital ellipses, rounded-rectangle pods, jet-age swooshes, and subtle 8-bit pixel patterns along borders or dividers. Faint CRT curvature vignette at edges. Thin vector grid lines receding to a vanishing point. Icons and illustrations should feel like arcade cabinet art meets Googie architecture meets NASA mission patches. Warm analog glow on all light sources — no harsh pure whites, everything filtered through amber or blue phosphor. The overall mood is optimistic, adventurous, and slightly nostalgic — a future that never was, rendered through a cathode ray tube.",
+        defaultAspectRatio: "4:5",
+    },
+    "fractal-arcade": {
+        description: "Geometric dithered fractal style. All shading via dithering patterns and geometric cross-hatch grids — no smooth gradients. Fractal backgrounds (Sierpinski, hexagonal tessellations, recursive diamonds), low-poly faceted subjects, retro CRT palette.",
+        promptPrefix: "Geometric dithered illustration style. All shading done through dithering patterns, halftone dots, and geometric cross-hatch grids — NO smooth gradients anywhere. Every surface rendered with visible pixel-level dithering like a 16-color EGA/VGA palette pushed through ordered Bayer matrix dithering. Fractal geometric patterns in the background — Sierpinski triangles, hexagonal tessellations, recursive diamond grids. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a), warm muted greens (#5a8a5c). Subjects built from clean geometric shapes — triangular facets, polygonal planes, like a low-poly render but flat and 2D with dithered color fills instead of smooth shading. Think: Saul Bass designed a character select screen for an Amiga game. Geometric line-art icons. Chunky retrofuturist typeface for headers, smaller geometric caps for subtitles. Horizontal scanline overlay. No photorealism, no soft shadows, no AI-gradient smoothness. Every color transition is a hard dither pattern. Clean, precise, geometric, but retro-cool.",
+        defaultAspectRatio: "4:5",
+    },
+};
+const STYLE_KEYS = Object.keys(STYLE_PRESETS);
+function applyStyle(prompt, style) {
+    if (!style || !STYLE_PRESETS[style])
+        return prompt;
+    return `${STYLE_PRESETS[style].promptPrefix}\n\nSubject/content: ${prompt}`;
+}
+function resolveAspectRatio(explicit, style) {
+    if (explicit !== "1:1")
+        return explicit; // user explicitly chose something
+    if (style && STYLE_PRESETS[style]?.defaultAspectRatio)
+        return STYLE_PRESETS[style].defaultAspectRatio;
+    return explicit;
+}
 // --- MCP server ---
 const server = new McpServer({ name: "nanobanana2", version: "1.0.0" }, { capabilities: { tools: {} } });
 server.tool("list_images", `List image files in the shared nanobanana2 directory (${SAVE_DIR}). Use this to find images available for editing.`, {}, async () => {
@@ -684,14 +715,20 @@ server.tool("generate_images", "Generate multiple images in parallel using Googl
         .enum(["512", "1K", "2K"])
         .default("1K")
         .describe("Image resolution"),
-}, async ({ prompts, aspect_ratio, image_size }) => {
+    style: z
+        .enum(STYLE_KEYS)
+        .optional()
+        .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended to each prompt and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+}, async ({ prompts, aspect_ratio, image_size, style }) => {
     try {
         await ensureViewer();
-        log(`generate_images: ${prompts.length} prompts, ${image_size}, ${aspect_ratio}`);
+        const resolvedAR = resolveAspectRatio(aspect_ratio, style);
+        log(`generate_images: ${prompts.length} prompts, ${image_size}, ${resolvedAR}${style ? ` [style: ${style}]` : ""}`);
         const t0 = Date.now();
         const results = await Promise.allSettled(prompts.map((prompt, i) => {
-            log(`  [${i + 1}/${prompts.length}] "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`);
-            return generateAndStore(prompt, aspect_ratio, image_size);
+            const styledPrompt = applyStyle(prompt, style);
+            log(`  [${i + 1}/${prompts.length}] "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}"`);
+            return generateAndStore(styledPrompt, resolvedAR, image_size);
         }));
         const content = [];
         let anySucceeded = false;
@@ -745,12 +782,18 @@ server.tool("generate_image", "Generate a single image using Google's Nanobanana
         .enum(["512", "1K", "2K"])
         .default("1K")
         .describe("Image resolution"),
-}, async ({ prompt, aspect_ratio, image_size }) => {
+    style: z
+        .enum(STYLE_KEYS)
+        .optional()
+        .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+}, async ({ prompt, aspect_ratio, image_size, style }) => {
     try {
         await ensureViewer();
-        log(`generate_image: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" (${image_size}, ${aspect_ratio})`);
+        const styledPrompt = applyStyle(prompt, style);
+        const resolvedAR = resolveAspectRatio(aspect_ratio, style);
+        log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
         const t0 = Date.now();
-        const { mcpBase64, mcpMimeType, text, filename } = await generateAndStore(prompt, aspect_ratio, image_size);
+        const { mcpBase64, mcpMimeType, text, filename } = await generateAndStore(styledPrompt, resolvedAR, image_size);
         log(`generate_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return {
             content: [
@@ -780,13 +823,19 @@ server.tool("edit_image", `Edit an existing image using Google's Nanobanana2 (Ge
         .enum(["512", "1K", "2K"])
         .default("1K")
         .describe("Output image resolution"),
-}, async ({ prompt, filename, aspect_ratio, image_size }) => {
+    style: z
+        .enum(STYLE_KEYS)
+        .optional()
+        .describe("Optional style preset to apply. When set, the style's prompt prefix is prepended and its default aspect ratio is used (unless you explicitly set one). Available: " + STYLE_KEYS.join(", ")),
+}, async ({ prompt, filename, aspect_ratio, image_size, style }) => {
     try {
         await ensureViewer();
-        log(`edit_image: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${aspect_ratio})`);
+        const styledPrompt = applyStyle(prompt, style);
+        const resolvedAR = resolveAspectRatio(aspect_ratio, style);
+        log(`edit_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
         const t0 = Date.now();
         const { base64: srcBase64, mime: srcMime } = await loadForGemini(filename);
-        const { mcpBase64, mcpMimeType, text, filename: outFilename } = await editAndStore(prompt, srcBase64, srcMime, aspect_ratio, image_size);
+        const { mcpBase64, mcpMimeType, text, filename: outFilename } = await editAndStore(styledPrompt, srcBase64, srcMime, resolvedAR, image_size);
         log(`edit_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return {
             content: [

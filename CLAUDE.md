@@ -23,6 +23,16 @@ Flash chokes on text-heavy images. The fix tools exploit this by sending smaller
 - `fix_region` — targeted region repair (percentage coords, auto aspect ratio snap)
 - `interactive_fix` — browser crop UI with multi-shot (1-5 parallel shots, user picks best)
 
+## Style Presets
+`generate_image`, `generate_images`, and `edit_image` accept an optional `style` parameter. When set, the preset's prompt prefix is prepended to the user's prompt, and its default aspect ratio is used (unless explicitly overridden).
+
+Current presets:
+- **`neo-brutalist`** — Neo-brutalist minimalist magazine editorial. Bold oversized typography, cream/black/terracotta palette, halftone textures, visible grid lines, asymmetric layout. Default aspect ratio: 4:5.
+- **`neo-retro-futurism`** — 1960s Space Age optimism meets 1980s arcade aesthetics. Cathode blue, warm amber, salmon red, warm green palette. Scanlines, CRT glow, atomic starbursts, pixel-grid accents, Googie geometry. Default aspect ratio: 4:5.
+- **`fractal-arcade`** — Geometric dithered fractal style. No smooth gradients — all shading via dithering, halftone dots, geometric cross-hatch. Sierpinski/hexagonal/diamond fractal backgrounds, low-poly faceted subjects, Amiga/EGA aesthetic. Cathode blue + amber palette. Default aspect ratio: 4:5.
+
+To add a new preset: add an entry to the `STYLE_PRESETS` object in `src/index.ts`, rebuild, and restart.
+
 ## Key Patterns
 - **Aspect ratio snapping**: `snapToAspectRatio()` — adjusts crop to nearest Gemini ratio, keeps center
 - **Histogram matching**: `matchHistogram()` — per-channel RGB linear normalization for seamless compositing
