@@ -10,8 +10,9 @@ import { join, extname } from "path";
 import { homedir } from "os";
 const SAVE_DIR = join(homedir(), "Pictures", "nanobanana2");
 const API_KEY = process.env.GOOGLE_API_KEY;
-const MODEL = "gemini-3.1-flash-image-preview";
-const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+const MODEL_PRIMARY = "gemini-3.1-flash-image-preview";
+const MODEL_FALLBACK = "gemini-2.5-flash-image-preview";
+const endpointFor = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 const VEO_MODEL = "veo-3.1-generate-preview";
 const VEO_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const VEO_ENDPOINT = `${VEO_BASE}/models/${VEO_MODEL}:predictLongRunning`;
@@ -28,7 +29,7 @@ const sseClients = new Set();
 const pendingSelections = new Map();
 const pendingCrops = new Map();
 function notifyViewerClients(img) {
-    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image" });
+    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed });
     for (const client of sseClients) {
         client.write(`data: ${event}\n\n`);
     }
@@ -233,11 +234,16 @@ function viewerHtml() {
         </div>`;
         }
         const img = item.data;
+        const isFallback = img.modelUsed && img.modelUsed !== MODEL_PRIMARY;
+        const fallbackBanner = isFallback
+            ? `<div class="fallback-banner">⚠️ Generated with <strong>${esc(img.modelUsed)}</strong> (free-tier fallback). Upgrade to <strong>${esc(MODEL_PRIMARY)}</strong> for higher-quality imagegen — <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.</div>`
+            : "";
         return `<div class="img-entry" id="img-${img.id}">
           <div class="prompt-row">
             <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
             <button class="respin-btn" onclick="respin('${img.id}', this)" title="Regenerate (edit prompt above to change)">&#x21bb; Respin</button>
           </div>
+          ${fallbackBanner}
           <img src="/img/${img.id}" />
         </div>`;
     })
@@ -260,6 +266,9 @@ function viewerHtml() {
   .respin-btn:hover { background: #3a6a9b; color: #fff; }
   .respin-btn:disabled { opacity: 0.5; cursor: wait; }
   .video-badge { background: #6b2a2a; color: #ff8b8b; border: 1px solid #9b3a3a; padding: 8px 16px; font-size: 11px; font-family: system-ui; border-radius: 4px; white-space: nowrap; align-self: flex-start; font-weight: 600; letter-spacing: 0.5px; }
+  .fallback-banner { background: #3a2e12; color: #f0c066; border: 1px solid #7a5c20; padding: 8px 12px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
+  .fallback-banner a { color: #ffd988; text-decoration: underline; }
+  .fallback-banner strong { color: #ffdf9e; }
 </style></head><body>
 <button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
 <p id="empty">Waiting for images...</p>
@@ -268,9 +277,10 @@ function viewerHtml() {
 const gallery = document.getElementById("gallery");
 const empty = document.getElementById("empty");
 const es = new EventSource("/events");
+const PRIMARY_MODEL = ${JSON.stringify(MODEL_PRIMARY)};
 es.onmessage = (e) => {
   const data = JSON.parse(e.data);
-  const { id, prompt, type, filename } = data;
+  const { id, prompt, type, filename, modelUsed } = data;
   empty.style.display = "none";
   const div = document.createElement("div");
   div.className = "img-entry";
@@ -311,9 +321,15 @@ es.onmessage = (e) => {
     btn.onclick = function() { respin(id, this); };
     row.appendChild(ta);
     row.appendChild(btn);
+    div.appendChild(row);
+    if (modelUsed && modelUsed !== PRIMARY_MODEL) {
+      const banner = document.createElement("div");
+      banner.className = "fallback-banner";
+      banner.innerHTML = '\u26A0\uFE0F Generated with <strong>' + modelUsed + '</strong> (free-tier fallback). Upgrade to <strong>' + PRIMARY_MODEL + '</strong> for higher-quality imagegen \u2014 <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.';
+      div.appendChild(banner);
+    }
     const img = document.createElement("img");
     img.src = "/img/" + id;
-    div.appendChild(row);
     div.appendChild(img);
   }
   gallery.prepend(div);
@@ -667,12 +683,23 @@ async function loadForGemini(filename) {
     const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
     return { base64: buf.toString("base64"), mime };
 }
-async function callGemini(inputParts, aspectRatio, imageSize) {
+function isPrepayError(msg) {
+    const m = msg.toLowerCase();
+    return (m.includes("prepay") ||
+        m.includes("prepaid") ||
+        m.includes("credits are depleted") ||
+        m.includes("billing is required") ||
+        m.includes("requires billing") ||
+        m.includes("enable billing") ||
+        m.includes("insufficient credit") ||
+        m.includes("billing account"));
+}
+async function callGeminiOnce(model, inputParts, aspectRatio, imageSize) {
     const t0 = Date.now();
-    log(`  Calling Gemini API (${imageSize}, ${aspectRatio}, ${inputParts.length} parts)...`);
+    log(`  Calling Gemini API [${model}] (${imageSize}, ${aspectRatio}, ${inputParts.length} parts)...`);
     let res;
     try {
-        res = await fetch(`${ENDPOINT}?key=${API_KEY}`, {
+        res = await fetch(`${endpointFor(model)}?key=${API_KEY}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -688,7 +715,7 @@ async function callGemini(inputParts, aspectRatio, imageSize) {
         throw new Error(`Network error calling Gemini API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
     }
     const elapsed = Date.now() - t0;
-    log(`  Gemini responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+    log(`  Gemini [${model}] responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
     const rawBody = await res.text();
     let data;
     try {
@@ -718,8 +745,23 @@ async function callGemini(inputParts, aspectRatio, imageSize) {
         const textContent = text ? `Model responded with text: "${text.slice(0, 1000)}"` : "No text content either.";
         throw new Error(`Gemini returned no image. ${textContent} | Parts structure: ${JSON.stringify(responseParts.map((p) => ({ hasText: !!p.text, hasInlineData: !!p.inlineData })))}`);
     }
-    log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64`);
+    log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${model}`);
     return { imageBase64, text };
+}
+async function callGemini(inputParts, aspectRatio, imageSize) {
+    try {
+        const result = await callGeminiOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
+        return { ...result, modelUsed: MODEL_PRIMARY };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isPrepayError(msg)) {
+            log(`  Prepay error on ${MODEL_PRIMARY} — falling back to ${MODEL_FALLBACK}. Original: ${msg.slice(0, 300)}`);
+            const result = await callGeminiOnce(MODEL_FALLBACK, inputParts, aspectRatio, imageSize);
+            return { ...result, modelUsed: MODEL_FALLBACK };
+        }
+        throw err;
+    }
 }
 // --- Veo API ---
 async function callVeo(prompt, aspectRatio, durationSeconds) {
@@ -799,20 +841,20 @@ async function callVeo(prompt, aspectRatio, durationSeconds) {
 }
 /** Generate, store, return shrunk for MCP */
 async function generateAndStore(prompt, aspectRatio, imageSize) {
-    const { imageBase64, text } = await callGemini([{ text: prompt }], aspectRatio, imageSize);
+    const { imageBase64, text, modelUsed } = await callGemini([{ text: prompt }], aspectRatio, imageSize);
     const fullPng = Buffer.from(imageBase64, "base64");
     const id = randomUUID();
     const filename = await saveToDisk(fullPng, id.slice(0, 8));
     log(`  Saved ${filename}`);
-    const img = { id, prompt, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize };
+    const img = { id, prompt, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize, modelUsed };
     imageStore.push(img);
     notifyViewerClients(img);
     const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
-    return { mcpBase64, mcpMimeType, text, filename };
+    return { mcpBase64, mcpMimeType, text, filename, modelUsed };
 }
 /** Edit, store, return shrunk for MCP */
 async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, imageSize) {
-    const { imageBase64, text } = await callGemini([
+    const { imageBase64, text, modelUsed } = await callGemini([
         { text: prompt },
         { inlineData: { mimeType: sourceMime, data: sourceBase64 } },
     ], aspectRatio, imageSize);
@@ -820,11 +862,19 @@ async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, image
     const id = randomUUID();
     const filename = await saveToDisk(fullPng, id.slice(0, 8));
     log(`  Saved ${filename}`);
-    const img = { id, prompt: `[edit] ${prompt}`, fullPng, timestamp: Date.now(), filename };
+    const img = { id, prompt: `[edit] ${prompt}`, fullPng, timestamp: Date.now(), filename, modelUsed };
     imageStore.push(img);
     notifyViewerClients(img);
     const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
-    return { mcpBase64, mcpMimeType, text, filename };
+    return { mcpBase64, mcpMimeType, text, filename, modelUsed };
+}
+/** Notice text to append to MCP responses when the fallback model was used. */
+const FALLBACK_NOTICE = `\u26A0\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image) — the free-tier-eligible fallback. ` +
+    `The primary ${MODEL_PRIMARY} (Gemini 3.1 Flash Image) requires a billed/prepaid Google AI account, ` +
+    `and your prepayment credits appear to be depleted. For higher-quality image generation, ` +
+    `top up credits at https://aistudio.google.com/ and re-run.`;
+function fallbackNoticeIfNeeded(modelUsed) {
+    return modelUsed === MODEL_PRIMARY ? "" : `\n\n${FALLBACK_NOTICE}`;
 }
 // --- Style presets ---
 const STYLE_PRESETS = {
@@ -957,10 +1007,13 @@ server.tool("generate_images", "Generate multiple images in parallel using Googl
         }));
         const content = [];
         let anySucceeded = false;
+        let anyFallback = false;
         for (let i = 0; i < results.length; i++) {
             const result = results[i];
             if (result.status === "fulfilled") {
                 anySucceeded = true;
+                if (result.value.modelUsed !== MODEL_PRIMARY)
+                    anyFallback = true;
                 content.push({
                     type: "text",
                     text: `Image ${i + 1}: ${result.value.filename}${result.value.text ? ` — ${result.value.text}` : ""}`,
@@ -982,7 +1035,7 @@ server.tool("generate_images", "Generate multiple images in parallel using Googl
         log(`generate_images complete: ${results.filter((r) => r.status === "fulfilled").length}/${prompts.length} succeeded in ${elapsed}s`);
         content.push({
             type: "text",
-            text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}`,
+            text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}${anyFallback ? `\n\n${FALLBACK_NOTICE}` : ""}`,
         });
         if (!anySucceeded)
             return { content, isError: true };
@@ -1018,13 +1071,13 @@ server.tool("generate_image", "Generate a single image using Google's Nanobanana
         const resolvedAR = resolveAspectRatio(aspect_ratio, style);
         log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
         const t0 = Date.now();
-        const { mcpBase64, mcpMimeType, text, filename } = await generateAndStore(styledPrompt, resolvedAR, image_size);
+        const { mcpBase64, mcpMimeType, text, filename, modelUsed } = await generateAndStore(styledPrompt, resolvedAR, image_size);
         log(`generate_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return {
             content: [
                 ...(text ? [{ type: "text", text }] : []),
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
-                { type: "text", text: `Saved as ${filename} — full-res at http://localhost:${viewerPort}` },
+                { type: "text", text: `Saved as ${filename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
             ],
         };
     }
@@ -1102,13 +1155,13 @@ server.tool("edit_image", `Edit an existing image using Google's Nanobanana2 (Ge
         log(`edit_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
         const t0 = Date.now();
         const { base64: srcBase64, mime: srcMime } = await loadForGemini(filename);
-        const { mcpBase64, mcpMimeType, text, filename: outFilename } = await editAndStore(styledPrompt, srcBase64, srcMime, resolvedAR, image_size);
+        const { mcpBase64, mcpMimeType, text, filename: outFilename, modelUsed } = await editAndStore(styledPrompt, srcBase64, srcMime, resolvedAR, image_size);
         log(`edit_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return {
             content: [
                 ...(text ? [{ type: "text", text }] : []),
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
-                { type: "text", text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+                { type: "text", text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
             ],
         };
     }
@@ -1190,11 +1243,11 @@ server.tool("fix_image", `Fix an image that has glitched or garbled text by spli
                 sendBuf = tile.buffer;
                 sendMime = "image/png";
             }
-            const { imageBase64 } = await callGemini([
+            const { imageBase64, modelUsed } = await callGemini([
                 { text: prompt },
                 { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
             ], bestAspect.label, image_size);
-            return { col: tile.col, row: tile.row, buffer: Buffer.from(imageBase64, "base64") };
+            return { col: tile.col, row: tile.row, buffer: Buffer.from(imageBase64, "base64"), modelUsed };
         }));
         // Check for failures
         const failed = fixResults.filter((r) => r.status === "rejected");
@@ -1235,12 +1288,22 @@ server.tool("fix_image", `Fix an image that has glitched or garbled text by spli
         const id = randomUUID();
         const outFilename = await saveToDisk(finalBuf, `fix_${id.slice(0, 8)}`);
         log(`  Stitched ${fixedTiles.length} tiles -> ${outFilename}`);
+        const tileModels = [];
+        for (const r of fixResults) {
+            if (r.status === "fulfilled") {
+                const m = r.value.modelUsed;
+                if (m)
+                    tileModels.push(m);
+            }
+        }
+        const imageModelUsed = tileModels.find((m) => m !== MODEL_PRIMARY) ?? MODEL_PRIMARY;
         const img = {
             id,
             prompt: `[fix ${grid}] ${prompt.slice(0, 60)}`,
             fullPng: finalBuf,
             timestamp: Date.now(),
             filename: outFilename,
+            modelUsed: imageModelUsed,
         };
         imageStore.push(img);
         notifyViewerClients(img);
@@ -1253,7 +1316,7 @@ server.tool("fix_image", `Fix an image that has glitched or garbled text by spli
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
                 {
                     type: "text",
-                    text: `Fixed ${successCount}/${tiles.length} tiles (${grid} grid). Saved as ${outFilename} — full-res at http://localhost:${viewerPort}`,
+                    text: `Fixed ${successCount}/${tiles.length} tiles (${grid} grid). Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(imageModelUsed)}`,
                 },
             ],
         };
@@ -1374,7 +1437,7 @@ server.tool("fix_region", `Fix a specific region of an image by cropping it out,
             sendMime = "image/png";
         }
         // Send to Gemini
-        const { imageBase64 } = await callGemini([
+        const { imageBase64, modelUsed } = await callGemini([
             { text: prompt },
             { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
         ], snapped.aspectLabel, image_size);
@@ -1400,6 +1463,7 @@ server.tool("fix_region", `Fix a specific region of an image by cropping it out,
             fullPng: finalBuf,
             timestamp: Date.now(),
             filename: outFilename,
+            modelUsed,
         };
         imageStore.push(img);
         notifyViewerClients(img);
@@ -1413,7 +1477,7 @@ server.tool("fix_region", `Fix a specific region of an image by cropping it out,
                     text: `Region snapped from ${pxW}x${pxH} to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})`,
                 },
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
-                { type: "text", text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}` },
+                { type: "text", text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
             ],
         };
     }
@@ -1486,7 +1550,7 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
         const geminiResults = await Promise.allSettled(Array.from({ length: shots }, (_, i) => callGemini([
             { text: prompt },
             { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
-        ], snapped.aspectLabel, image_size).then(async ({ imageBase64 }) => {
+        ], snapped.aspectLabel, image_size).then(async ({ imageBase64, modelUsed }) => {
             // Resize, histogram match, and composite each result
             let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
                 .resize(snapped.width, snapped.height, { fit: "fill" })
@@ -1507,10 +1571,11 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
                 fullPng: compositedBuf,
                 timestamp: Date.now(),
                 filename: shotFilename,
+                modelUsed,
             };
             imageStore.push(img);
             notifyViewerClients(img);
-            return { filename: shotFilename, buffer: compositedBuf };
+            return { filename: shotFilename, buffer: compositedBuf, modelUsed };
         })));
         const succeeded = geminiResults
             .filter((r) => r.status === "fulfilled")
@@ -1522,10 +1587,12 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
         log(`  ${succeeded.length}/${shots} shots succeeded`);
         let chosenFilename;
         let chosenBuffer;
+        let chosenModel;
         if (succeeded.length === 1) {
             // Single result — use it directly
             chosenFilename = succeeded[0].filename;
             chosenBuffer = succeeded[0].buffer;
+            chosenModel = succeeded[0].modelUsed;
             completeResolve({ ok: true, filename: chosenFilename });
         }
         else {
@@ -1539,6 +1606,7 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
             });
             chosenFilename = succeeded[selectedIndex].filename;
             chosenBuffer = succeeded[selectedIndex].buffer;
+            chosenModel = succeeded[selectedIndex].modelUsed;
             log(`  User selected shot ${selectedIndex + 1}: ${chosenFilename}`);
         }
         const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(chosenBuffer);
@@ -1549,7 +1617,7 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
                     text: `User selected region: ${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}% ${submission.width.toFixed(1)}%x${submission.height.toFixed(1)}% -> snapped to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})\n${shots} shot(s), ${succeeded.length} succeeded. User picked: ${chosenFilename}\nUser notes: ${submission.prompt || "(none)"}`,
                 },
                 { type: "image", data: mcpBase64, mimeType: mcpMimeType },
-                { type: "text", text: `Saved as ${chosenFilename} — full-res at http://localhost:${viewerPort}` },
+                { type: "text", text: `Saved as ${chosenFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(chosenModel)}` },
             ],
         };
     }

@@ -78,7 +78,7 @@ Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric 
 3. Click **Create API Key** and copy it
 4. The key needs access to **Gemini 3.1 Flash Image** (image generation) and optionally **Veo 3** (video generation)
 
-> The free tier includes generous limits for experimentation. See [Google AI pricing](https://ai.google.dev/pricing) for details.
+> ⚠️ **Prepayment required.** Google does not offer a free tier for Gemini 3.1 Flash Image or Veo 3. You must enable billing and prepay credits on your Google AI account before these models will respond. See [Google AI pricing](https://ai.google.dev/pricing) for current rates.
 
 ### Prerequisites
 
