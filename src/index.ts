@@ -12,8 +12,31 @@ import { homedir } from "os";
 const SAVE_DIR = join(homedir(), "Pictures", "nanobanana2");
 
 const API_KEY = process.env.GOOGLE_API_KEY!;
-const MODEL_PRIMARY = "gemini-3.1-flash-image-preview";
-const MODEL_FALLBACK = "gemini-2.5-flash-image-preview";
+
+// Model registry — add new image-gen models here. The key is the user-facing
+// identifier (exposed as the `model` tool param); `id` is the raw API model name.
+const MODELS = {
+  "gemini-3.1-flash-image": {
+    id: "gemini-3.1-flash-image-preview",
+    label: "Gemini 3.1 Flash Image",
+    tier: "paid",
+  },
+  "gemini-2.5-flash-image": {
+    id: "gemini-2.5-flash-image",
+    label: "Gemini 2.5 Flash Image",
+    tier: "free",
+  },
+} as const;
+
+type ModelKey = keyof typeof MODELS;
+const MODEL_KEYS = Object.keys(MODELS) as [ModelKey, ...ModelKey[]];
+const DEFAULT_MODEL_KEY: ModelKey = "gemini-3.1-flash-image";
+const FALLBACK_MODEL_KEY: ModelKey = "gemini-2.5-flash-image";
+
+// Legacy aliases used by viewer banner comparison / fallback notice
+const MODEL_PRIMARY = MODELS[DEFAULT_MODEL_KEY].id;
+const MODEL_FALLBACK = MODELS[FALLBACK_MODEL_KEY].id;
+
 const endpointFor = (model: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
@@ -163,7 +186,7 @@ function startViewer(): Promise<number> {
       // Interactive crop UI
       if (url.pathname.startsWith("/crop/")) {
         const fname = decodeURIComponent(url.pathname.slice(6));
-        res.writeHead(200, { "Content-Type": "text/html" });
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(cropHtml(fname));
         return;
       }
@@ -276,7 +299,7 @@ function startViewer(): Promise<number> {
         return;
       }
 
-      res.writeHead(200, { "Content-Type": "text/html" });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(viewerHtml());
     });
 
@@ -881,8 +904,16 @@ async function callGeminiOnce(
 async function callGemini(
   inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
   aspectRatio: string,
-  imageSize: string
+  imageSize: string,
+  modelKey?: ModelKey
 ): Promise<{ imageBase64: string; text: string; modelUsed: string }> {
+  // Explicit model override — run it directly, no fallback.
+  if (modelKey) {
+    const modelId = MODELS[modelKey].id;
+    const result = await callGeminiOnce(modelId, inputParts, aspectRatio, imageSize);
+    return { ...result, modelUsed: modelId };
+  }
+  // Default path — try primary, fall back to free-tier model on prepay error.
   try {
     const result = await callGeminiOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
     return { ...result, modelUsed: MODEL_PRIMARY };
@@ -1002,9 +1033,10 @@ async function callVeo(
 async function generateAndStore(
   prompt: string,
   aspectRatio: string,
-  imageSize: string
+  imageSize: string,
+  modelKey?: ModelKey
 ): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string; modelUsed: string }> {
-  const { imageBase64, text, modelUsed } = await callGemini([{ text: prompt }], aspectRatio, imageSize);
+  const { imageBase64, text, modelUsed } = await callGemini([{ text: prompt }], aspectRatio, imageSize, modelKey);
 
   const fullPng = Buffer.from(imageBase64, "base64");
   const id = randomUUID();
@@ -1025,7 +1057,8 @@ async function editAndStore(
   sourceBase64: string,
   sourceMime: string,
   aspectRatio: string,
-  imageSize: string
+  imageSize: string,
+  modelKey?: ModelKey
 ): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string; modelUsed: string }> {
   const { imageBase64, text, modelUsed } = await callGemini(
     [
@@ -1033,7 +1066,8 @@ async function editAndStore(
       { inlineData: { mimeType: sourceMime, data: sourceBase64 } },
     ],
     aspectRatio,
-    imageSize
+    imageSize,
+    modelKey
   );
 
   const fullPng = Buffer.from(imageBase64, "base64");
@@ -1049,15 +1083,36 @@ async function editAndStore(
   return { mcpBase64, mcpMimeType, text, filename, modelUsed };
 }
 
-/** Notice text to append to MCP responses when the fallback model was used. */
-const FALLBACK_NOTICE =
+/** Notice text to append to MCP responses when the auto-fallback model was used. */
+const AUTO_FALLBACK_NOTICE =
   `\u26A0\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image) — the free-tier-eligible fallback. ` +
   `The primary ${MODEL_PRIMARY} (Gemini 3.1 Flash Image) requires a billed/prepaid Google AI account, ` +
   `and your prepayment credits appear to be depleted. For higher-quality image generation, ` +
   `top up credits at https://aistudio.google.com/ and re-run.`;
 
-function fallbackNoticeIfNeeded(modelUsed: string): string {
-  return modelUsed === MODEL_PRIMARY ? "" : `\n\n${FALLBACK_NOTICE}`;
+/** Notice text when the user explicitly chose the free model. */
+const EXPLICIT_FREE_NOTICE =
+  `\u2139\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image, free tier, as requested). ` +
+  `For higher-quality image generation, pass model='${DEFAULT_MODEL_KEY}' — this requires prepaid credits on your Google AI account.`;
+
+const MODEL_PARAM_DESCRIPTION =
+  `Model to use. Default is '${DEFAULT_MODEL_KEY}' (${MODELS[DEFAULT_MODEL_KEY].label}, paid tier, highest quality). ` +
+  `Pass '${FALLBACK_MODEL_KEY}' (${MODELS[FALLBACK_MODEL_KEY].label}, free tier) for generations that don't require billing. ` +
+  `If omitted, the default model is used with automatic fallback to the free-tier model on prepay/billing errors.`;
+
+function noticeFor(modelUsed: string, explicitModelKey?: ModelKey): string {
+  if (modelUsed === MODEL_PRIMARY) return "";
+  const notice = explicitModelKey ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE;
+  return `\n\n${notice}`;
+}
+
+/** 2.5 Flash Image rejects "512" — auto-bump to "1K". */
+function resolveImageSize(imageSize: string, modelKey?: ModelKey): string {
+  if (modelKey === "gemini-2.5-flash-image" && imageSize === "512") {
+    log(`  Note: gemini-2.5-flash-image doesn't support image_size=512, using 1K instead`);
+    return "1K";
+  }
+  return imageSize;
 }
 
 // --- Style presets ---
@@ -1205,19 +1260,21 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ prompts, aspect_ratio, image_size, style }) => {
+  async ({ prompts, aspect_ratio, image_size, style, model }) => {
     try {
       await ensureViewer();
       const resolvedAR = resolveAspectRatio(aspect_ratio, style);
-      log(`generate_images: ${prompts.length} prompts, ${image_size}, ${resolvedAR}${style ? ` [style: ${style}]` : ""}`);
+      log(`generate_images: ${prompts.length} prompts, ${image_size}, ${resolvedAR}${style ? ` [style: ${style}]` : ""}${model ? ` [model: ${model}]` : ""}`);
       const t0 = Date.now();
 
+      const resolvedSize = resolveImageSize(image_size, model);
       const results = await Promise.allSettled(
         prompts.map((prompt, i) => {
           const styledPrompt = applyStyle(prompt, style);
           log(`  [${i + 1}/${prompts.length}] "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}"`);
-          return generateAndStore(styledPrompt, resolvedAR, image_size);
+          return generateAndStore(styledPrompt, resolvedAR, resolvedSize, model);
         })
       );
 
@@ -1255,7 +1312,7 @@ server.tool(
 
       content.push({
         type: "text" as const,
-        text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}${anyFallback ? `\n\n${FALLBACK_NOTICE}` : ""}`,
+        text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}${anyFallback ? `\n\n${model ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE}` : ""}`,
       });
 
       if (!anySucceeded) return { content, isError: true };
@@ -1288,16 +1345,18 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ prompt, aspect_ratio, image_size, style }) => {
+  async ({ prompt, aspect_ratio, image_size, style, model }) => {
     try {
       await ensureViewer();
       const styledPrompt = applyStyle(prompt, style);
       const resolvedAR = resolveAspectRatio(aspect_ratio, style);
-      log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
+      log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}${model ? ` [model: ${model}]` : ""}`);
       const t0 = Date.now();
 
-      const { mcpBase64, mcpMimeType, text, filename, modelUsed } = await generateAndStore(styledPrompt, resolvedAR, image_size);
+      const resolvedSize = resolveImageSize(image_size, model);
+      const { mcpBase64, mcpMimeType, text, filename, modelUsed } = await generateAndStore(styledPrompt, resolvedAR, resolvedSize, model);
 
       log(`generate_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
@@ -1305,7 +1364,7 @@ server.tool(
         content: [
           ...(text ? [{ type: "text" as const, text }] : []),
           { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
-          { type: "text" as const, text: `Saved as ${filename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
+          { type: "text" as const, text: `Saved as ${filename} — full-res at http://localhost:${viewerPort}${noticeFor(modelUsed, model)}` },
         ],
       };
     } catch (err: unknown) {
@@ -1389,23 +1448,26 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ prompt, filename, aspect_ratio, image_size, style }) => {
+  async ({ prompt, filename, aspect_ratio, image_size, style, model }) => {
     try {
       await ensureViewer();
       const styledPrompt = applyStyle(prompt, style);
       const resolvedAR = resolveAspectRatio(aspect_ratio, style);
-      log(`edit_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}`);
+      log(`edit_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" source=${filename} (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}${model ? ` [model: ${model}]` : ""}`);
       const t0 = Date.now();
 
       const { base64: srcBase64, mime: srcMime } = await loadForGemini(filename);
 
+      const resolvedSize = resolveImageSize(image_size, model);
       const { mcpBase64, mcpMimeType, text, filename: outFilename, modelUsed } = await editAndStore(
         styledPrompt,
         srcBase64,
         srcMime,
         resolvedAR,
-        image_size
+        resolvedSize,
+        model
       );
 
       log(`edit_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -1414,7 +1476,7 @@ server.tool(
         content: [
           ...(text ? [{ type: "text" as const, text }] : []),
           { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
-          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
+          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${noticeFor(modelUsed, model)}` },
         ],
       };
     } catch (err: unknown) {
@@ -1599,7 +1661,7 @@ server.tool(
           { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
           {
             type: "text" as const,
-            text: `Fixed ${successCount}/${tiles.length} tiles (${grid} grid). Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(imageModelUsed)}`,
+            text: `Fixed ${successCount}/${tiles.length} tiles (${grid} grid). Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${noticeFor(imageModelUsed)}`,
           },
         ],
       };
@@ -1785,7 +1847,7 @@ server.tool(
             text: `Region snapped from ${pxW}x${pxH} to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})`,
           },
           { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
-          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(modelUsed)}` },
+          { type: "text" as const, text: `Saved as ${outFilename} — full-res at http://localhost:${viewerPort}${noticeFor(modelUsed)}` },
         ],
       };
     } catch (err: unknown) {
@@ -1958,7 +2020,7 @@ server.tool(
             text: `User selected region: ${submission.x.toFixed(1)}%,${submission.y.toFixed(1)}% ${submission.width.toFixed(1)}%x${submission.height.toFixed(1)}% -> snapped to ${snapped.width}x${snapped.height} (${snapped.aspectLabel})\n${shots} shot(s), ${succeeded.length} succeeded. User picked: ${chosenFilename}\nUser notes: ${submission.prompt || "(none)"}`,
           },
           { type: "image" as const, data: mcpBase64, mimeType: mcpMimeType },
-          { type: "text" as const, text: `Saved as ${chosenFilename} — full-res at http://localhost:${viewerPort}${fallbackNoticeIfNeeded(chosenModel)}` },
+          { type: "text" as const, text: `Saved as ${chosenFilename} — full-res at http://localhost:${viewerPort}${noticeFor(chosenModel)}` },
         ],
       };
     } catch (err: unknown) {
