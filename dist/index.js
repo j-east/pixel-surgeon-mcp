@@ -31,6 +31,8 @@ const FALLBACK_MODEL_KEY = "gemini-2.5-flash-image";
 const MODEL_PRIMARY = MODELS[DEFAULT_MODEL_KEY].id;
 const MODEL_FALLBACK = MODELS[FALLBACK_MODEL_KEY].id;
 const endpointFor = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+const RESPIN_SIZES = ["512", "1K", "2K", "4K"];
+const RESPIN_ASPECTS = ["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"];
 const VEO_MODEL = "veo-3.1-generate-preview";
 const VEO_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const VEO_ENDPOINT = `${VEO_BASE}/models/${VEO_MODEL}:predictLongRunning`;
@@ -47,9 +49,28 @@ const sseClients = new Set();
 const pendingSelections = new Map();
 const pendingCrops = new Map();
 function notifyViewerClients(img) {
-    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed });
+    void writeSidecar(img);
+    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed, imageSize: img.imageSize, aspectRatio: img.aspectRatio });
     for (const client of sseClients) {
         client.write(`data: ${event}\n\n`);
+    }
+}
+async function writeSidecar(img) {
+    const sidecarName = img.filename.replace(/\.[^./]+$/, "") + ".json";
+    const meta = {
+        id: img.id,
+        filename: img.filename,
+        prompt: img.prompt,
+        aspectRatio: img.aspectRatio ?? null,
+        imageSize: img.imageSize ?? null,
+        modelUsed: img.modelUsed ?? null,
+        timestamp: img.timestamp,
+    };
+    try {
+        await writeFile(join(SAVE_DIR, sidecarName), JSON.stringify(meta, null, 2));
+    }
+    catch (err) {
+        log(`sidecar write failed for ${img.filename}: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
 function notifyViewerClientsVideo(vid) {
@@ -182,22 +203,75 @@ function startViewer() {
                 res.end();
                 return;
             }
+            // History — paginated/searchable listing of persisted image sidecars
+            if (url.pathname === "/history" && req.method === "GET") {
+                (async () => {
+                    try {
+                        const offset = Math.max(0, parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
+                        const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
+                        const q = (url.searchParams.get("q") ?? "").toLowerCase().trim();
+                        await ensureSaveDir();
+                        const files = await readdir(SAVE_DIR);
+                        const jsonFiles = files.filter((f) => f.endsWith(".json")).sort().reverse();
+                        const readMeta = async (f) => {
+                            try {
+                                const raw = await readFile(join(SAVE_DIR, f), "utf-8");
+                                return JSON.parse(raw);
+                            }
+                            catch {
+                                return null;
+                            }
+                        };
+                        let items;
+                        let total;
+                        if (q) {
+                            const all = [];
+                            for (const f of jsonFiles) {
+                                const meta = await readMeta(f);
+                                if (meta && (meta.prompt ?? "").toLowerCase().includes(q))
+                                    all.push(meta);
+                            }
+                            total = all.length;
+                            items = all.slice(offset, offset + limit);
+                        }
+                        else {
+                            total = jsonFiles.length;
+                            const slice = jsonFiles.slice(offset, offset + limit);
+                            const loaded = await Promise.all(slice.map(readMeta));
+                            items = loaded.filter((m) => m !== null);
+                        }
+                        const hasMore = offset + items.length < total;
+                        res.writeHead(200, { "Content-Type": "application/json" });
+                        res.end(JSON.stringify({ items, total, hasMore, offset, limit }));
+                    }
+                    catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        res.writeHead(500, { "Content-Type": "application/json" });
+                        res.end(JSON.stringify({ error: msg }));
+                    }
+                })();
+                return;
+            }
             // Respin endpoint — regenerate an image with the same prompt
             if (url.pathname === "/respin" && req.method === "POST") {
                 let body = "";
                 req.on("data", (chunk) => { body += chunk.toString(); });
                 req.on("end", async () => {
                     try {
-                        const { id, prompt: customPrompt } = JSON.parse(body);
-                        const source = imageStore.find((i) => i.id === id);
-                        if (!source) {
-                            res.writeHead(404, { "Content-Type": "application/json" });
-                            res.end(JSON.stringify({ error: "Image not found" }));
+                        const { id, prompt: customPrompt, size, aspect } = JSON.parse(body);
+                        const source = id ? imageStore.find((i) => i.id === id) : undefined;
+                        const finalPrompt = (customPrompt && customPrompt.trim())
+                            ? customPrompt.trim()
+                            : source?.prompt;
+                        if (!finalPrompt) {
+                            res.writeHead(400, { "Content-Type": "application/json" });
+                            res.end(JSON.stringify({ error: "No prompt provided and source not in live store" }));
                             return;
                         }
-                        const finalPrompt = (customPrompt && customPrompt.trim()) ? customPrompt.trim() : source.prompt;
-                        log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${source.imageSize ?? "1K"}, ${source.aspectRatio ?? "1:1"})`);
-                        const result = await generateAndStore(finalPrompt, source.aspectRatio ?? "1:1", source.imageSize ?? "1K");
+                        const finalSize = (typeof size === "string" && size) ? size : (source?.imageSize ?? "1K");
+                        const finalAspect = (typeof aspect === "string" && aspect) ? aspect : (source?.aspectRatio ?? "1:1");
+                        log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${finalSize}, ${finalAspect})`);
+                        const result = await generateAndStore(finalPrompt, finalAspect, finalSize);
                         res.writeHead(200, { "Content-Type": "application/json" });
                         res.end(JSON.stringify({ ok: true, id: imageStore[imageStore.length - 1].id, filename: result.filename }));
                     }
@@ -256,10 +330,18 @@ function viewerHtml() {
         const fallbackBanner = isFallback
             ? `<div class="fallback-banner">⚠️ Generated with <strong>${esc(img.modelUsed)}</strong> (free-tier fallback). Upgrade to <strong>${esc(MODEL_PRIMARY)}</strong> for higher-quality imagegen — <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.</div>`
             : "";
+        const curSize = img.imageSize ?? "1K";
+        const curAspect = img.aspectRatio ?? "1:1";
+        const sizeOpts = RESPIN_SIZES.map(s => `<option value="${s}"${s === curSize ? " selected" : ""}>${s}</option>`).join("");
+        const aspectOpts = RESPIN_ASPECTS.map(a => `<option value="${a}"${a === curAspect ? " selected" : ""}>${a}</option>`).join("");
         return `<div class="img-entry" id="img-${img.id}">
           <div class="prompt-row">
             <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
-            <button class="respin-btn" onclick="respin('${img.id}', this)" title="Regenerate (edit prompt above to change)">&#x21bb; Respin</button>
+            <div class="respin-controls">
+              <select class="respin-select" data-size="${img.id}" title="Resolution">${sizeOpts}</select>
+              <select class="respin-select" data-aspect="${img.id}" title="Aspect ratio">${aspectOpts}</select>
+              <button class="respin-btn" onclick="respin('${img.id}', this)" title="Regenerate (edit prompt / size / aspect above)">&#x21bb; Respin</button>
+            </div>
           </div>
           ${fallbackBanner}
           <img src="/img/${img.id}" />
@@ -280,22 +362,57 @@ function viewerHtml() {
   .prompt-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
   .prompt-edit { flex: 1; background: #252525; color: #bbb; border: 1px solid #444; padding: 8px; font-size: 13px; font-family: system-ui; border-radius: 4px; resize: vertical; min-height: 48px; line-height: 1.4; }
   .prompt-edit:focus { border-color: #3a6a9b; color: #ddd; outline: none; }
-  .respin-btn { background: #2a4a6b; color: #8bc4ff; border: 1px solid #3a6a9b; padding: 8px 16px; cursor: pointer; font-size: 13px; font-family: system-ui; border-radius: 4px; transition: all 0.15s; white-space: nowrap; align-self: flex-start; }
+  .respin-controls { display: flex; flex-direction: column; gap: 4px; align-self: flex-start; }
+  .respin-select { background: #252525; color: #bbb; border: 1px solid #444; padding: 4px 6px; font-size: 12px; font-family: system-ui; border-radius: 4px; cursor: pointer; min-width: 72px; }
+  .respin-select:hover { border-color: #3a6a9b; color: #ddd; }
+  .respin-btn { background: #2a4a6b; color: #8bc4ff; border: 1px solid #3a6a9b; padding: 8px 16px; cursor: pointer; font-size: 13px; font-family: system-ui; border-radius: 4px; transition: all 0.15s; white-space: nowrap; }
   .respin-btn:hover { background: #3a6a9b; color: #fff; }
   .respin-btn:disabled { opacity: 0.5; cursor: wait; }
   .video-badge { background: #6b2a2a; color: #ff8b8b; border: 1px solid #9b3a3a; padding: 8px 16px; font-size: 11px; font-family: system-ui; border-radius: 4px; white-space: nowrap; align-self: flex-start; font-weight: 600; letter-spacing: 0.5px; }
   .fallback-banner { background: #3a2e12; color: #f0c066; border: 1px solid #7a5c20; padding: 8px 12px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
   .fallback-banner a { color: #ffd988; text-decoration: underline; }
   .fallback-banner strong { color: #ffdf9e; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #333; }
+  .tab-btn { background: transparent; color: #888; border: none; border-bottom: 2px solid transparent; padding: 10px 18px; cursor: pointer; font-size: 14px; font-family: system-ui; transition: all 0.15s; }
+  .tab-btn:hover { color: #ccc; }
+  .tab-btn.active { color: #8bc4ff; border-bottom-color: #3a6a9b; }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .history-toolbar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
+  .history-search { flex: 1; min-width: 240px; background: #252525; color: #ddd; border: 1px solid #444; padding: 8px 12px; font-size: 13px; font-family: system-ui; border-radius: 4px; }
+  .history-search:focus { border-color: #3a6a9b; outline: none; }
+  .history-status { color: #777; font-size: 12px; }
+  .history-load-more { background: #2a4a6b; color: #8bc4ff; border: 1px solid #3a6a9b; padding: 10px 24px; cursor: pointer; font-size: 13px; font-family: system-ui; border-radius: 4px; margin: 16px auto; display: block; }
+  .history-load-more:hover { background: #3a6a9b; color: #fff; }
+  .history-load-more:disabled { opacity: 0.5; cursor: wait; }
+  .history-entry { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #2a2a2a; }
+  .history-meta { color: #777; font-size: 11px; font-family: ui-monospace, monospace; margin-top: 4px; }
+  .history-prompt { background: #252525; color: #bbb; border: 1px solid #444; padding: 8px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; line-height: 1.4; }
 </style></head><body>
-<button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
-<p id="empty">Waiting for images...</p>
-<div id="gallery">${itemTags}</div>
+<div class="tabs">
+  <button class="tab-btn active" data-tab="live" onclick="switchTab('live')">Live</button>
+  <button class="tab-btn" data-tab="history" onclick="switchTab('history')">History</button>
+</div>
+<div class="tab-pane active" id="tab-live">
+  <button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
+  <p id="empty">Waiting for images...</p>
+  <div id="gallery">${itemTags}</div>
+</div>
+<div class="tab-pane" id="tab-history">
+  <div class="history-toolbar">
+    <input class="history-search" id="history-search" type="text" placeholder="Search prompts..." />
+    <span class="history-status" id="history-status"></span>
+  </div>
+  <div id="history-gallery"></div>
+  <button class="history-load-more" id="history-load-more" style="display:none;" onclick="loadMoreHistory()">Load 100 more</button>
+</div>
 <script>
 const gallery = document.getElementById("gallery");
 const empty = document.getElementById("empty");
 const es = new EventSource("/events");
 const PRIMARY_MODEL = ${JSON.stringify(MODEL_PRIMARY)};
+const RESPIN_SIZES = ${JSON.stringify(RESPIN_SIZES)};
+const RESPIN_ASPECTS = ${JSON.stringify(RESPIN_ASPECTS)};
 es.onmessage = (e) => {
   const data = JSON.parse(e.data);
   const { id, prompt, type, filename, modelUsed } = data;
@@ -332,13 +449,40 @@ es.onmessage = (e) => {
     ta.className = "prompt-edit";
     ta.dataset.id = id;
     ta.value = prompt;
+    const controls = document.createElement("div");
+    controls.className = "respin-controls";
+    const curSize = data.imageSize || "1K";
+    const curAspect = data.aspectRatio || "1:1";
+    const sizeSel = document.createElement("select");
+    sizeSel.className = "respin-select";
+    sizeSel.dataset.size = id;
+    sizeSel.title = "Resolution";
+    RESPIN_SIZES.forEach(function(s) {
+      const o = document.createElement("option");
+      o.value = s; o.textContent = s;
+      if (s === curSize) o.selected = true;
+      sizeSel.appendChild(o);
+    });
+    const aspectSel = document.createElement("select");
+    aspectSel.className = "respin-select";
+    aspectSel.dataset.aspect = id;
+    aspectSel.title = "Aspect ratio";
+    RESPIN_ASPECTS.forEach(function(a) {
+      const o = document.createElement("option");
+      o.value = a; o.textContent = a;
+      if (a === curAspect) o.selected = true;
+      aspectSel.appendChild(o);
+    });
     const btn = document.createElement("button");
     btn.className = "respin-btn";
     btn.innerHTML = "&#x21bb; Respin";
-    btn.title = "Regenerate (edit prompt above to change)";
+    btn.title = "Regenerate (edit prompt / size / aspect above)";
     btn.onclick = function() { respin(id, this); };
+    controls.appendChild(sizeSel);
+    controls.appendChild(aspectSel);
+    controls.appendChild(btn);
     row.appendChild(ta);
-    row.appendChild(btn);
+    row.appendChild(controls);
     div.appendChild(row);
     if (modelUsed && modelUsed !== PRIMARY_MODEL) {
       const banner = document.createElement("div");
@@ -357,8 +501,12 @@ async function respin(id, btn) {
   btn.textContent = "Generating...";
   const ta = document.querySelector('textarea[data-id="' + id + '"]');
   const prompt = ta ? ta.value : undefined;
+  const sizeEl = document.querySelector('select[data-size="' + id + '"]');
+  const aspectEl = document.querySelector('select[data-aspect="' + id + '"]');
+  const size = sizeEl ? sizeEl.value : undefined;
+  const aspect = aspectEl ? aspectEl.value : undefined;
   try {
-    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, prompt }) });
+    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, prompt, size, aspect }) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Respin failed");
     btn.textContent = "\u21bb Respin";
@@ -368,6 +516,183 @@ async function respin(id, btn) {
     btn.disabled = false;
   }
 }
+
+// === Tabs + History ===
+const HISTORY_INITIAL = 20;
+const HISTORY_PAGE = 100;
+const historyState = { offset: 0, query: "", total: 0, hasMore: false, loaded: false, pending: false };
+
+function switchTab(name) {
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab-pane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  if (name === "history" && !historyState.loaded) {
+    historyState.loaded = true;
+    resetAndLoadHistory(HISTORY_INITIAL);
+  }
+}
+
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmtTs(ts) {
+  if (!ts) return "";
+  try { return new Date(ts).toLocaleString(); } catch { return ""; }
+}
+
+async function resetAndLoadHistory(limit) {
+  historyState.offset = 0;
+  historyState.total = 0;
+  historyState.hasMore = false;
+  document.getElementById("history-gallery").innerHTML = "";
+  await fetchHistoryPage(limit);
+}
+
+async function fetchHistoryPage(limit) {
+  if (historyState.pending) return;
+  historyState.pending = true;
+  const btn = document.getElementById("history-load-more");
+  const statusEl = document.getElementById("history-status");
+  if (btn) btn.disabled = true;
+  statusEl.textContent = "Loading...";
+  try {
+    const params = new URLSearchParams();
+    params.set("offset", String(historyState.offset));
+    params.set("limit", String(limit));
+    if (historyState.query) params.set("q", historyState.query);
+    const res = await fetch("/history?" + params.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "History fetch failed");
+    historyState.total = data.total;
+    historyState.hasMore = data.hasMore;
+    historyState.offset += data.items.length;
+    renderHistoryItems(data.items);
+    statusEl.textContent = historyState.total + " match" + (historyState.total === 1 ? "" : "es") + " · showing " + historyState.offset;
+    if (btn) btn.style.display = historyState.hasMore ? "block" : "none";
+    if (historyState.total === 0) {
+      document.getElementById("history-gallery").innerHTML = '<p style="color:#777;padding:20px 0;">No images found.</p>';
+    }
+  } catch (err) {
+    statusEl.textContent = "Error: " + (err && err.message ? err.message : "failed");
+  } finally {
+    historyState.pending = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderHistoryItems(items) {
+  const gallery = document.getElementById("history-gallery");
+  for (const it of items) {
+    const div = document.createElement("div");
+    div.className = "history-entry";
+    const key = it.filename || "";
+    const curSize = it.imageSize || "1K";
+    const curAspect = it.aspectRatio || "1:1";
+    const meta = [fmtTs(it.timestamp), curSize, curAspect, it.modelUsed || "?"].filter(Boolean).join(" · ");
+
+    const row = document.createElement("div");
+    row.className = "prompt-row";
+    const ta = document.createElement("textarea");
+    ta.className = "prompt-edit";
+    ta.dataset.histId = key;
+    ta.value = it.prompt || "";
+    const controls = document.createElement("div");
+    controls.className = "respin-controls";
+    const sizeSel = document.createElement("select");
+    sizeSel.className = "respin-select";
+    sizeSel.dataset.histSize = key;
+    sizeSel.title = "Resolution";
+    RESPIN_SIZES.forEach((s) => {
+      const o = document.createElement("option");
+      o.value = s; o.textContent = s;
+      if (s === curSize) o.selected = true;
+      sizeSel.appendChild(o);
+    });
+    const aspectSel = document.createElement("select");
+    aspectSel.className = "respin-select";
+    aspectSel.dataset.histAspect = key;
+    aspectSel.title = "Aspect ratio";
+    RESPIN_ASPECTS.forEach((a) => {
+      const o = document.createElement("option");
+      o.value = a; o.textContent = a;
+      if (a === curAspect) o.selected = true;
+      aspectSel.appendChild(o);
+    });
+    const btn = document.createElement("button");
+    btn.className = "respin-btn";
+    btn.innerHTML = "&#x21bb; Respin";
+    btn.title = "Regenerate and switch to Live tab";
+    btn.onclick = function () { respinHistory(key, this); };
+    controls.appendChild(sizeSel);
+    controls.appendChild(aspectSel);
+    controls.appendChild(btn);
+    row.appendChild(ta);
+    row.appendChild(controls);
+
+    const metaDiv = document.createElement("div");
+    metaDiv.className = "history-meta";
+    metaDiv.textContent = (it.filename || "") + " · " + meta;
+
+    const img = document.createElement("img");
+    img.src = "/file/" + encodeURIComponent(key);
+    img.loading = "lazy";
+
+    div.appendChild(row);
+    div.appendChild(metaDiv);
+    div.appendChild(img);
+    gallery.appendChild(div);
+  }
+}
+
+async function respinHistory(key, btn) {
+  btn.disabled = true;
+  btn.textContent = "Generating...";
+  const ta = document.querySelector('textarea[data-hist-id="' + key + '"]');
+  const sizeEl = document.querySelector('select[data-hist-size="' + key + '"]');
+  const aspectEl = document.querySelector('select[data-hist-aspect="' + key + '"]');
+  const prompt = ta ? ta.value : undefined;
+  const size = sizeEl ? sizeEl.value : undefined;
+  const aspect = aspectEl ? aspectEl.value : undefined;
+  if (!prompt || !prompt.trim()) {
+    btn.textContent = "Need prompt";
+    btn.disabled = false;
+    return;
+  }
+  switchTab("live");
+  try {
+    const res = await fetch("/respin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, size, aspect }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Respin failed");
+    btn.textContent = "\u21bb Respin";
+    btn.disabled = false;
+  } catch (err) {
+    btn.textContent = "Failed — retry?";
+    btn.disabled = false;
+  }
+}
+
+async function loadMoreHistory() {
+  await fetchHistoryPage(HISTORY_PAGE);
+}
+
+let searchDebounce;
+document.addEventListener("DOMContentLoaded", () => {
+  const searchEl = document.getElementById("history-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", (e) => {
+      clearTimeout(searchDebounce);
+      const val = e.target.value;
+      searchDebounce = setTimeout(() => {
+        historyState.query = val.trim();
+        resetAndLoadHistory(HISTORY_INITIAL);
+      }, 250);
+    });
+  }
+});
 </script>
 </body></html>`;
 }
@@ -1029,7 +1354,7 @@ server.tool("generate_images", "Generate multiple images in parallel using Googl
         .default("1:1")
         .describe("Aspect ratio for all generated images"),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Image resolution"),
     style: z
@@ -1101,7 +1426,7 @@ server.tool("generate_image", "Generate a single image using Google's Nanobanana
         .default("1:1")
         .describe("Aspect ratio for the image"),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Image resolution"),
     style: z
@@ -1186,7 +1511,7 @@ server.tool("edit_image", `Edit an existing image using Google's Nanobanana2 (Ge
         .default("1:1")
         .describe("Aspect ratio for the output image"),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Output image resolution"),
     style: z
@@ -1233,7 +1558,7 @@ server.tool("fix_image", `Fix an image that has glitched or garbled text by spli
         .default("2x2")
         .describe("How to split the image: cols x rows"),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Resolution for each tile's Gemini call"),
 }, async ({ filename, prompt, grid, image_size }) => {
@@ -1445,7 +1770,7 @@ server.tool("fix_region", `Fix a specific region of an image by cropping it out,
     width: z.number().min(1).max(100).describe("Width of region as percentage of image width (1-100)"),
     height: z.number().min(1).max(100).describe("Height of region as percentage of image height (1-100)"),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Resolution for the Gemini call on the cropped region"),
 }, async ({ filename, prompt, x, y, width, height, image_size }) => {
@@ -1541,7 +1866,7 @@ server.tool("fix_region", `Fix a specific region of an image by cropping it out,
 server.tool("interactive_fix", `Opens an image in a browser-based crop tool where the user can draw a rectangle around the region to fix, add notes/instructions, and submit. The tool waits for the user's selection, then sends the cropped region to Gemini for repair and composites it back into the original image. Best for precise, user-guided fixes.`, {
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
     image_size: z
-        .enum(["512", "1K", "2K"])
+        .enum(["512", "1K", "2K", "4K"])
         .default("1K")
         .describe("Resolution for the Gemini call on the cropped region"),
 }, async ({ filename, image_size }) => {
