@@ -9,8 +9,8 @@
     "dev": "tsx watch src/index.ts"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "John Evans",
+  "license": "MIT",
   "description": "MCP server for generating images with Google's Nanobanana2 (Gemini 3.1 Flash Image)",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
