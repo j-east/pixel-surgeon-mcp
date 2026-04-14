@@ -11,6 +11,24 @@ import { homedir } from "os";
 
 const SAVE_DIR = join(homedir(), "Pictures", "nanobanana2");
 
+/** Platform-aware "open URL/path in default app" with fallback chain for Linux */
+function openExternal(target: string): void {
+  import("child_process").then(({ execFile }) => {
+    if (process.platform === "darwin") {
+      execFile("open", [target]);
+    } else if (process.platform === "win32") {
+      execFile("cmd", ["/c", "start", "", target]);
+    } else {
+      // Linux: try xdg-open, then common DE-specific openers, then browsers
+      const candidates = ["xdg-open", "gio", "kde-open5", "gnome-open", "wslview"];
+      (function tryNext(i: number) {
+        if (i >= candidates.length) return;
+        execFile(candidates[i], [target], (err) => { if (err) tryNext(i + 1); });
+      })(0);
+    }
+  });
+}
+
 const API_KEY = process.env.GOOGLE_API_KEY!;
 
 // Model registry — add new image-gen models here. The key is the user-facing
@@ -268,7 +286,7 @@ function startViewer(): Promise<number> {
       }
 
       if (url.pathname === "/open-folder") {
-        import("child_process").then(({ exec }) => exec(`open "${SAVE_DIR}"`));
+        openExternal(SAVE_DIR);
         res.writeHead(204);
         res.end();
         return;
@@ -2218,8 +2236,7 @@ server.tool(
       // Open crop UI in browser
       const cropUrl = `http://localhost:${viewerPort}/crop/${encodeURIComponent(filename)}`;
       log(`  Opening crop URL: ${cropUrl}`);
-      const { execFile } = await import("child_process");
-      execFile("open", [cropUrl]);
+      openExternal(cropUrl);
 
       // Wait for the user to submit a crop selection
       log(`  Waiting for user to select region in browser...`);
@@ -2461,8 +2478,7 @@ async function ensureViewer() {
   viewerStarted = true;
   viewerPort = await startViewer();
   log(`Viewer running at http://localhost:${viewerPort}`);
-  const { exec } = await import("child_process");
-  exec(`open http://localhost:${viewerPort}`);
+  openExternal(`http://localhost:${viewerPort}`);
 }
 
 async function main() {
