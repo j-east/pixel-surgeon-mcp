@@ -45,6 +45,26 @@ Flash struggles with text-heavy images. The fix tools solve this by sending smal
 | `list_images` | List generated images and videos |
 | `save_image` | Import an external image into the workspace |
 
+## Models & automatic fallback
+
+By default the server uses **`gemini-3.1-flash-image`** (the paid-tier "nanobanana2" model), which supports `512`, `1K`, `2K`, and `4K` output.
+
+If a generation call fails with a billing / prepay error (e.g. your API project has no credits), the server automatically retries on the free-tier **`gemini-2.5-flash-image`** model so your request still succeeds. When this happens the viewer shows a yellow banner on the affected image so you know it came from the fallback.
+
+Free-tier `gemini-2.5-flash-image` has notable constraints to be aware of:
+
+| Limit | Value |
+|---|---|
+| Max resolution | **1K** (1024px) — 2K/4K not supported |
+| Requests per minute | 10 RPM |
+| Requests per day | **500 RPD** |
+| Tokens per minute | ~250k TPM |
+| Quota reset | Midnight Pacific Time |
+
+Free-tier quotas are **per Google Cloud project**, not per API key, so additional keys in the same project don't increase your limit. If you request `2K` or `4K` while the fallback is active, the call will fail — use `1K` to stay inside free-tier capabilities, or top up credits on your paid project to get full `gemini-3.1-flash-image` access back.
+
+You can also force a specific model per-call via the `model` tool parameter.
+
 ## Style presets
 
 All generation and edit tools support an optional `style` parameter:
