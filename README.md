@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/architecture.png" alt="nanobanana2-mcp architecture" width="800" />
+  <img src="assets/architecture.png" alt="pixel-surgeon-mcp architecture" width="800" />
 </p>
 
-<h1 align="center">nanobanana2-mcp</h1>
+<h1 align="center">pixel-surgeon-mcp</h1>
 
 <p align="center">
-  <strong>MCP server for AI image &amp; video generation</strong><br/>
+  <strong>MCP server for AI image &amp; video generation, editing, and transplant-grade region repair</strong><br/>
   Powered by Gemini 3.1 Flash Image and Veo 3
 </p>
 
@@ -107,8 +107,8 @@ Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric 
 ### Install
 
 ```bash
-git clone https://github.com/j-east/nanobanana2-mcp.git
-cd nanobanana2-mcp
+git clone https://github.com/j-east/pixel-surgeon-mcp.git
+cd pixel-surgeon-mcp
 npm install
 npm run build
 ```
@@ -122,7 +122,7 @@ Add to your Claude Code or Claude Desktop config:
   "mcpServers": {
     "nanobanana2": {
       "command": "node",
-      "args": ["/path/to/nanobanana2-mcp/dist/index.js"],
+      "args": ["/path/to/pixel-surgeon-mcp/dist/index.js"],
       "env": {
         "GOOGLE_API_KEY": "your-api-key-here"
       }
@@ -164,11 +164,11 @@ Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should incl
 
 ### Model adapters
 
-Currently nanobanana2 is wired to Gemini 3.1 Flash Image and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, DALL-E, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
+Currently pixel-surgeon-mcp is wired to Gemini 3.1 Flash Image and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, DALL-E, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
 
 ## Built by Duval Software
 
-nanobanana2-mcp is maintained by [John Evans](https://github.com/j-east), part of the engineering team at [Duval Software](https://duvalsoftware.com) — a software engineering firm in Jacksonville Beach, FL building AI-powered tools and custom integrations. If you need MCP servers, AI pipelines, or production tooling built, [get in touch](https://duvalsoftware.com).
+pixel-surgeon-mcp is maintained by [John Evans](https://github.com/j-east), part of the engineering team at [Duval Software](https://duvalsoftware.com) — a software engineering firm in Jacksonville Beach, FL building AI-powered tools and custom integrations. If you need MCP servers, AI pipelines, or production tooling built, [get in touch](https://duvalsoftware.com).
 
 ## License
 
