@@ -8,7 +8,7 @@ import { randomUUID } from "crypto";
 import { writeFile, readFile, mkdir, readdir, copyFile, stat } from "fs/promises";
 import { join, extname } from "path";
 import { homedir } from "os";
-const SAVE_DIR = join(homedir(), "Pictures", "nanobanana2");
+const SAVE_DIR = join(homedir(), "Pictures", "pixel-surgeon");
 /** Platform-aware "open URL/path in default app" with fallback chain for Linux */
 function openExternal(target) {
     import("child_process").then(({ execFile }) => {
@@ -61,7 +61,7 @@ const VEO_POLL_INTERVAL = 10_000; // 10 seconds
 const VEO_MAX_POLLS = 60; // 10 minutes max
 const MAX_MCP_BYTES = 950_000;
 function log(msg) {
-    console.error(`[nanobanana2 ${new Date().toISOString()}] ${msg}`);
+    console.error(`[pixel-surgeon ${new Date().toISOString()}] ${msg}`);
 }
 const imageStore = [];
 const videoStore = [];
@@ -1303,8 +1303,8 @@ function resolveAspectRatio(explicit, style) {
     return explicit;
 }
 // --- MCP server ---
-const server = new McpServer({ name: "nanobanana2", version: "1.0.0" }, { capabilities: { tools: {} } });
-server.tool("list_images", `List image and video files in the shared nanobanana2 directory (${SAVE_DIR}). Use this to find images available for editing.`, {}, async () => {
+const server = new McpServer({ name: "pixel-surgeon", version: "1.0.0" }, { capabilities: { tools: {} } });
+server.tool("list_images", `List image and video files in the shared pixel-surgeon directory (${SAVE_DIR}). Use this to find images available for editing.`, {}, async () => {
     try {
         await ensureSaveDir();
         const files = await readdir(SAVE_DIR);
@@ -1336,7 +1336,7 @@ server.tool("list_images", `List image and video files in the shared nanobanana2
         };
     }
 });
-server.tool("save_image", `Copy an image file into the shared nanobanana2 directory (${SAVE_DIR}) so it can be used with edit_image. Use this when the user wants to edit an image that exists elsewhere on their filesystem.`, {
+server.tool("save_image", `Copy an image file into the shared pixel-surgeon directory (${SAVE_DIR}) so it can be used with edit_image. Use this when the user wants to edit an image that exists elsewhere on their filesystem.`, {
     source_path: z.string().describe("Absolute path to the image file to import"),
 }, async ({ source_path }) => {
     try {

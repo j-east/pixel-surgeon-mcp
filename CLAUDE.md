@@ -1,10 +1,10 @@
-# Nanobanana2 MCP Server
+# Pixel Surgeon MCP Server
 
 ## Quick Reference
 - **Build**: `npm run build` (TypeScript -> dist/)
 - **Dev**: `npm run dev` (tsx watch mode)
 - **Start**: `npm run start` (run compiled server)
-- **Images dir**: `~/Pictures/nanobanana2`
+- **Images dir**: `~/Pictures/pixel-surgeon`
 
 ## Architecture
 MCP server on stdio transport. Single source file: `src/index.ts`.
