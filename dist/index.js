@@ -71,6 +71,8 @@ function getDefaultModelKey() {
     const envModel = process.env.DEFAULT_IMAGE_MODEL;
     if (envModel && envModel in MODELS)
         return envModel;
+    if (process.env.OPENAI_API_KEY)
+        return "gpt-image-2";
     return GEMINI_DEFAULT;
 }
 const providers = {};

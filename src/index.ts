@@ -115,6 +115,7 @@ function isGeminiModel(modelId: string): boolean {
 function getDefaultModelKey(): ModelKey {
   const envModel = process.env.DEFAULT_IMAGE_MODEL;
   if (envModel && envModel in MODELS) return envModel as ModelKey;
+  if (process.env.OPENAI_API_KEY) return "gpt-image-2";
   return GEMINI_DEFAULT;
 }
 
