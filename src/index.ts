@@ -550,6 +550,7 @@ function viewerHtml(): string {
 <html><head><title>pixel-surgeon-mcp</title>
 <style>
   body { margin: 20px; background: #1a1a1a; color: #ccc; font-family: system-ui; }
+  .page-title { position: fixed; top: 12px; right: 16px; font-size: 12px; font-family: ui-monospace, monospace; color: #555; z-index: 100; pointer-events: none; letter-spacing: 0.5px; }
   img { max-width: 100%; }
   video { max-width: 100%; border-radius: 4px; }
   div.img-entry { margin-bottom: 24px; }
@@ -589,6 +590,7 @@ function viewerHtml(): string {
   .history-meta { color: #777; font-size: 11px; font-family: ui-monospace, monospace; margin-top: 4px; }
   .history-prompt { background: #252525; color: #bbb; border: 1px solid #444; padding: 8px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; line-height: 1.4; }
 </style></head><body>
+<div class="page-title">pixel-surgeon-mcp image viewer</div>
 <div class="tabs">
   <button class="tab-btn active" data-tab="live" onclick="switchTab('live')">Live</button>
   <button class="tab-btn" data-tab="history" onclick="switchTab('history')">History</button>
