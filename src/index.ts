@@ -2793,6 +2793,13 @@ async function ensureViewer() {
 }
 
 async function main() {
+  if (process.argv.includes("--viewer")) {
+    viewerPort = await startViewer();
+    console.log(`pixel-surgeon-mcp viewer running at http://localhost:${viewerPort}`);
+    openExternal(`http://localhost:${viewerPort}`);
+    return;
+  }
+
   if (GOOGLE_API_KEY) {
     providers["gemini"] = new GeminiProvider();
     log("Gemini provider available");

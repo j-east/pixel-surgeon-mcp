@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "viewer": "node dist/index.js --viewer",
     "dev": "tsx watch src/index.ts"
   },
   "keywords": [],
