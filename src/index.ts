@@ -2793,13 +2793,6 @@ async function ensureViewer() {
 }
 
 async function main() {
-  if (process.argv.includes("--viewer")) {
-    viewerPort = await startViewer();
-    console.log(`pixel-surgeon-mcp viewer running at http://localhost:${viewerPort}`);
-    openExternal(`http://localhost:${viewerPort}`);
-    return;
-  }
-
   if (GOOGLE_API_KEY) {
     providers["gemini"] = new GeminiProvider();
     log("Gemini provider available");
@@ -2808,6 +2801,17 @@ async function main() {
     providers["openai"] = new OpenAIProvider();
     log("OpenAI provider available");
   }
+
+  if (process.argv.includes("--viewer")) {
+    if (!GOOGLE_API_KEY && !OPENAI_API_KEY) {
+      console.log("Note: No API keys set — viewer is read-only (respin disabled). Set GOOGLE_API_KEY or OPENAI_API_KEY to enable generation.");
+    }
+    viewerPort = await startViewer();
+    console.log(`pixel-surgeon-mcp viewer running at http://localhost:${viewerPort}`);
+    openExternal(`http://localhost:${viewerPort}`);
+    return;
+  }
+
   if (!GOOGLE_API_KEY && !OPENAI_API_KEY) {
     log("WARNING: Neither GOOGLE_API_KEY nor OPENAI_API_KEY is set. No image providers available.");
   }
