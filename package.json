@@ -11,7 +11,7 @@
   "keywords": [],
   "author": "John Evans",
   "license": "MIT",
-  "description": "MCP server for generating images with Google's Nanobanana2 (Gemini 3.1 Flash Image)",
+  "description": "MCP server for generating and editing images with Gemini and OpenAI",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "sharp": "^0.34.5",

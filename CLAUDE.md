@@ -9,16 +9,24 @@
 ## Architecture
 MCP server on stdio transport. Single source file: `src/index.ts`.
 
-Google's image gen pipeline ("nanobanana2"):
-1. Gemini 3.1 Pro reasons about the prompt (text output)
-2. Gemini Flash Image renders the pixels
+Multi-provider image generation via `ImageProvider` interface. Each provider implements `generate()` and `edit()`. Providers are registered at startup based on available API keys.
+
+### Providers
+- **Gemini** (`GeminiProvider`) — Google's nanobanana2 pipeline. Gemini 3.1 Flash Image (paid) with auto-fallback to 2.5 Flash Image (free) on billing errors. Supports 9 aspect ratios and 4 image sizes.
+- **OpenAI** (`OpenAIProvider`) — GPT Image 1 and GPT Image 2. gpt-image-1 maps to 3 fixed sizes; gpt-image-2 supports flexible resolutions (true 2K/4K at all 9 aspect ratios). Image size param mapped to quality (medium/high). Prefer gpt-image-2 for text-heavy images — it has dramatically better text rendering.
+
+### Adding a new provider
+1. Implement `ImageProvider` interface (generate + edit)
+2. Add model entry to `MODELS` registry with `provider` field
+3. Register in `main()` based on env var availability
 
 Flash chokes on text-heavy images. The fix tools exploit this by sending smaller regions.
 
-Video generation uses Veo 3 (async API with polling). Supports 16:9 and 9:16, 5s or 8s duration. Generates both video and ambient audio.
+Video generation uses Veo 3 (async API with polling, Gemini only). Supports 16:9 and 9:16, 5s or 8s duration. Generates both video and ambient audio.
 
 ## Tools (9)
 - `generate_image` / `generate_images` — text-to-image (single / parallel batch)
+  - `generate_images` applies a single `style` to ALL images in the batch. To generate images in different styles, use separate `generate_image` calls (they can run in parallel).
 - `generate_video` — text-to-video via Veo 3 (async polling, 1-3 min, generates audio)
 - `edit_image` — edit existing image with instructions
 - `list_images` / `save_image` — file management
@@ -43,7 +51,10 @@ To add a new preset: add an entry to the `STYLE_PRESETS` object in `src/index.ts
 - **Held HTTP responses**: `/crop-submit` stays open until Gemini finishes; `/crop-select` awaits user pick
 
 ## Environment
-- Requires `GOOGLE_API_KEY` env var
+- `GOOGLE_API_KEY` — enables Gemini provider
+- `OPENAI_API_KEY` — enables OpenAI provider
+- `DEFAULT_IMAGE_MODEL` — optional, sets default model (e.g. `gpt-image-1`). Falls back to `gemini-3.1-flash-image`.
+- At least one API key must be set
 - Viewer auto-opens browser on first tool use (random local port)
 
 ## When Editing

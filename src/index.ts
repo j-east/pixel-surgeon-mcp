@@ -29,33 +29,110 @@ function openExternal(target: string): void {
   });
 }
 
-const API_KEY = process.env.GOOGLE_API_KEY!;
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY ?? "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 
-// Model registry — add new image-gen models here. The key is the user-facing
-// identifier (exposed as the `model` tool param); `id` is the raw API model name.
-const MODELS = {
+// --- Provider abstraction ---
+
+interface GenerateRequest {
+  prompt: string;
+  aspectRatio: string;
+  imageSize: string;
+  modelId: string;
+}
+
+interface EditRequest {
+  prompt: string;
+  imageBase64: string;
+  imageMime: string;
+  aspectRatio: string;
+  imageSize: string;
+  modelId: string;
+}
+
+interface ProviderResult {
+  imageBase64: string;
+  text: string;
+  modelUsed: string;
+}
+
+interface ImageProvider {
+  name: string;
+  generate(req: GenerateRequest): Promise<ProviderResult>;
+  edit(req: EditRequest): Promise<ProviderResult>;
+}
+
+// --- Model registry ---
+
+type ProviderName = "gemini" | "openai";
+
+const MODELS: Record<string, {
+  id: string;
+  label: string;
+  provider: ProviderName;
+  tier: string;
+}> = {
   "gemini-3.1-flash-image": {
     id: "gemini-3.1-flash-image-preview",
     label: "Gemini 3.1 Flash Image",
+    provider: "gemini",
     tier: "paid",
   },
   "gemini-2.5-flash-image": {
     id: "gemini-2.5-flash-image",
     label: "Gemini 2.5 Flash Image",
+    provider: "gemini",
     tier: "free",
   },
-} as const;
+  "gpt-image-1": {
+    id: "gpt-image-1",
+    label: "GPT Image 1 (OpenAI)",
+    provider: "openai",
+    tier: "paid",
+  },
+  "gpt-image-2": {
+    id: "gpt-image-2",
+    label: "GPT Image 2 (OpenAI)",
+    provider: "openai",
+    tier: "paid",
+  },
+};
 
-type ModelKey = keyof typeof MODELS;
-const MODEL_KEYS = Object.keys(MODELS) as [ModelKey, ...ModelKey[]];
-const DEFAULT_MODEL_KEY: ModelKey = "gemini-3.1-flash-image";
-const FALLBACK_MODEL_KEY: ModelKey = "gemini-2.5-flash-image";
+type ModelKey = string & keyof typeof MODELS;
+const MODEL_KEYS = Object.keys(MODELS) as [string, ...string[]];
 
-// Legacy aliases used by viewer banner comparison / fallback notice
-const MODEL_PRIMARY = MODELS[DEFAULT_MODEL_KEY].id;
-const MODEL_FALLBACK = MODELS[FALLBACK_MODEL_KEY].id;
+const GEMINI_DEFAULT: ModelKey = "gemini-3.1-flash-image";
+const GEMINI_FALLBACK: ModelKey = "gemini-2.5-flash-image";
 
-const endpointFor = (model: string) =>
+const MODEL_PRIMARY = MODELS[GEMINI_DEFAULT].id;
+const MODEL_FALLBACK = MODELS[GEMINI_FALLBACK].id;
+
+function isGeminiModel(modelId: string): boolean {
+  const entry = Object.values(MODELS).find(m => m.id === modelId);
+  return entry?.provider === "gemini";
+}
+
+function getDefaultModelKey(): ModelKey {
+  const envModel = process.env.DEFAULT_IMAGE_MODEL;
+  if (envModel && envModel in MODELS) return envModel as ModelKey;
+  return GEMINI_DEFAULT;
+}
+
+const providers: Record<string, ImageProvider> = {};
+
+function getProvider(modelKey?: ModelKey): { provider: ImageProvider; modelId: string; modelKey: ModelKey } {
+  const key = modelKey ?? getDefaultModelKey();
+  const entry = MODELS[key];
+  if (!entry) throw new Error(`Unknown model "${key}". Available: ${MODEL_KEYS.join(", ")}`);
+  const provider = providers[entry.provider];
+  if (!provider) {
+    const envHint = entry.provider === "gemini" ? "GOOGLE_API_KEY" : "OPENAI_API_KEY";
+    throw new Error(`Provider "${entry.provider}" not available. Set ${envHint} env var.`);
+  }
+  return { provider, modelId: entry.id, modelKey: key };
+}
+
+const geminiEndpoint = (model: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
 const RESPIN_SIZES = ["512", "1K", "2K", "4K"] as const;
@@ -359,7 +436,7 @@ function startViewer(): Promise<number> {
         req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
         req.on("end", async () => {
           try {
-            const { id, prompt: customPrompt, size, aspect } = JSON.parse(body);
+            const { id, prompt: customPrompt, size, aspect, model: respinModel } = JSON.parse(body);
             const source = id ? imageStore.find((i) => i.id === id) : undefined;
             const finalPrompt = (customPrompt && customPrompt.trim())
               ? customPrompt.trim()
@@ -371,11 +448,13 @@ function startViewer(): Promise<number> {
             }
             const finalSize = (typeof size === "string" && size) ? size : (source?.imageSize ?? "1K");
             const finalAspect = (typeof aspect === "string" && aspect) ? aspect : (source?.aspectRatio ?? "1:1");
-            log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${finalSize}, ${finalAspect})`);
+            const finalModel = (typeof respinModel === "string" && respinModel in MODELS) ? respinModel as ModelKey : undefined;
+            log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${finalSize}, ${finalAspect}${finalModel ? `, model=${finalModel}` : ""})`);
             const result = await generateAndStore(
               finalPrompt,
               finalAspect,
-              finalSize
+              finalSize,
+              finalModel
             );
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true, id: imageStore[imageStore.length - 1].id, filename: result.filename }));
@@ -437,7 +516,7 @@ function viewerHtml(): string {
         </div>`;
       }
       const img = item.data;
-      const isFallback = img.modelUsed && img.modelUsed !== MODEL_PRIMARY;
+      const isFallback = img.modelUsed && img.modelUsed !== MODEL_PRIMARY && isGeminiModel(img.modelUsed);
       const fallbackBanner = isFallback
         ? `<div class="fallback-banner">⚠️ Generated with <strong>${esc(img.modelUsed!)}</strong> (free-tier fallback). Upgrade to <strong>${esc(MODEL_PRIMARY)}</strong> for higher-quality imagegen — <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.</div>`
         : "";
@@ -596,7 +675,7 @@ es.onmessage = (e) => {
     row.appendChild(ta);
     row.appendChild(controls);
     div.appendChild(row);
-    if (modelUsed && modelUsed !== PRIMARY_MODEL) {
+    if (modelUsed && modelUsed !== PRIMARY_MODEL && modelUsed.startsWith('gemini')) {
       const banner = document.createElement("div");
       banner.className = "fallback-banner";
       banner.innerHTML = '\u26A0\uFE0F Generated with <strong>' + modelUsed + '</strong> (free-tier fallback). Upgrade to <strong>' + PRIMARY_MODEL + '</strong> for higher-quality imagegen \u2014 <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.';
@@ -1161,7 +1240,7 @@ async function loadForGemini(filename: string): Promise<{ base64: string; mime: 
   return { base64: buf.toString("base64"), mime };
 }
 
-// --- Gemini API ---
+// --- Gemini provider ---
 
 interface GeminiPart {
   text?: string;
@@ -1187,100 +1266,273 @@ function isPrepayError(msg: string): boolean {
   );
 }
 
-async function callGeminiOnce(
-  model: string,
-  inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
-  aspectRatio: string,
-  imageSize: string
-): Promise<{ imageBase64: string; text: string }> {
-  const t0 = Date.now();
-  log(`  Calling Gemini API [${model}] (${imageSize}, ${aspectRatio}, ${inputParts.length} parts)...`);
+class GeminiProvider implements ImageProvider {
+  name = "gemini";
 
-  let res: Response;
-  try {
-    res = await fetch(`${endpointFor(model)}?key=${API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: inputParts }],
-        generationConfig: {
-          responseModalities: ["TEXT", "IMAGE"],
-          imageConfig: { aspectRatio, imageSize },
-        },
-      }),
-    });
-  } catch (fetchErr: unknown) {
-    throw new Error(
-      `Network error calling Gemini API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`
+  async generate(req: GenerateRequest): Promise<ProviderResult> {
+    return this.call([{ text: req.prompt }], req.aspectRatio, req.imageSize);
+  }
+
+  async edit(req: EditRequest): Promise<ProviderResult> {
+    return this.call(
+      [
+        { text: req.prompt },
+        { inlineData: { mimeType: req.imageMime, data: req.imageBase64 } },
+      ],
+      req.aspectRatio,
+      req.imageSize,
     );
   }
 
-  const elapsed = Date.now() - t0;
-  log(`  Gemini [${model}] responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+  private async callOnce(
+    model: string,
+    inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
+    aspectRatio: string,
+    imageSize: string,
+  ): Promise<{ imageBase64: string; text: string }> {
+    const t0 = Date.now();
+    log(`  Calling Gemini API [${model}] (${imageSize}, ${aspectRatio}, ${inputParts.length} parts)...`);
 
-  const rawBody = await res.text();
-  let data: GeminiResponse;
-  try {
-    data = JSON.parse(rawBody);
-  } catch {
-    throw new Error(`Gemini API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+    let res: Response;
+    try {
+      res = await fetch(`${geminiEndpoint(model)}?key=${GOOGLE_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: inputParts }],
+          generationConfig: {
+            responseModalities: ["TEXT", "IMAGE"],
+            imageConfig: { aspectRatio, imageSize },
+          },
+        }),
+      });
+    } catch (fetchErr: unknown) {
+      throw new Error(
+        `Network error calling Gemini API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`
+      );
+    }
+
+    const elapsed = Date.now() - t0;
+    log(`  Gemini [${model}] responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+
+    const rawBody = await res.text();
+    let data: GeminiResponse;
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`Gemini API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+    }
+
+    if (!res.ok || data.error) {
+      const safeBody = rawBody.length > 3000 ? rawBody.slice(0, 3000) + "... [truncated]" : rawBody;
+      throw new Error(`Gemini API HTTP ${res.status}: ${data.error?.message ?? "unknown error"}. Full response: ${safeBody}`);
+    }
+
+    const candidate = data.candidates?.[0];
+    if (!candidate?.content?.parts?.length) {
+      throw new Error(
+        `Gemini API returned no content parts. Full response: ${JSON.stringify(data, (k, v) => (k === "data" && typeof v === "string" && v.length > 100 ? "[truncated]" : v))}`
+      );
+    }
+
+    const responseParts = candidate.content.parts;
+    let imageBase64 = "";
+    let text = "";
+    for (const part of responseParts) {
+      if (part.inlineData) imageBase64 = part.inlineData.data;
+      if (part.text) text = part.text;
+    }
+
+    if (!imageBase64) {
+      const textContent = text ? `Model responded with text: "${text.slice(0, 1000)}"` : "No text content either.";
+      throw new Error(
+        `Gemini returned no image. ${textContent} | Parts structure: ${JSON.stringify(responseParts.map((p) => ({ hasText: !!p.text, hasInlineData: !!p.inlineData })))}`
+      );
+    }
+
+    log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${model}`);
+    return { imageBase64, text };
   }
 
-  if (!res.ok || data.error) {
-    const safeBody = rawBody.length > 3000 ? rawBody.slice(0, 3000) + "... [truncated]" : rawBody;
-    throw new Error(`Gemini API HTTP ${res.status}: ${data.error?.message ?? "unknown error"}. Full response: ${safeBody}`);
-  }
+  private async call(
+    inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
+    aspectRatio: string,
+    imageSize: string,
+  ): Promise<ProviderResult> {
+    const defaultKey = getDefaultModelKey();
+    const isGeminiDefault = MODELS[defaultKey]?.provider === "gemini";
 
-  const candidate = data.candidates?.[0];
-  if (!candidate?.content?.parts?.length) {
-    throw new Error(
-      `Gemini API returned no content parts. Full response: ${JSON.stringify(data, (k, v) => (k === "data" && typeof v === "string" && v.length > 100 ? "[truncated]" : v))}`
-    );
-  }
+    if (!isGeminiDefault) {
+      const result = await this.callOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
+      return { ...result, modelUsed: MODEL_PRIMARY };
+    }
 
-  const responseParts = candidate.content.parts;
-  let imageBase64 = "";
-  let text = "";
-  for (const part of responseParts) {
-    if (part.inlineData) imageBase64 = part.inlineData.data;
-    if (part.text) text = part.text;
+    try {
+      const result = await this.callOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
+      return { ...result, modelUsed: MODEL_PRIMARY };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isPrepayError(msg)) {
+        log(`  Prepay error on ${MODEL_PRIMARY} — falling back to ${MODEL_FALLBACK}. Original: ${msg.slice(0, 300)}`);
+        const result = await this.callOnce(MODEL_FALLBACK, inputParts, aspectRatio, imageSize);
+        return { ...result, modelUsed: MODEL_FALLBACK };
+      }
+      throw err;
+    }
   }
-
-  if (!imageBase64) {
-    const textContent = text ? `Model responded with text: "${text.slice(0, 1000)}"` : "No text content either.";
-    throw new Error(
-      `Gemini returned no image. ${textContent} | Parts structure: ${JSON.stringify(responseParts.map((p) => ({ hasText: !!p.text, hasInlineData: !!p.inlineData })))}`
-    );
-  }
-
-  log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${model}`);
-  return { imageBase64, text };
 }
 
-async function callGemini(
-  inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
-  aspectRatio: string,
-  imageSize: string,
-  modelKey?: ModelKey
-): Promise<{ imageBase64: string; text: string; modelUsed: string }> {
-  // Explicit model override — run it directly, no fallback.
-  if (modelKey) {
-    const modelId = MODELS[modelKey].id;
-    const result = await callGeminiOnce(modelId, inputParts, aspectRatio, imageSize);
-    return { ...result, modelUsed: modelId };
+// --- OpenAI provider ---
+
+const OPENAI_V1_SIZE_MAP: Record<string, string> = {
+  "1:1":  "1024x1024",
+  "16:9": "1536x1024",
+  "9:16": "1024x1536",
+  "3:4":  "1024x1536",
+  "4:3":  "1536x1024",
+  "2:3":  "1024x1536",
+  "3:2":  "1536x1024",
+  "4:5":  "1024x1536",
+  "5:4":  "1536x1024",
+};
+
+const OPENAI_V2_SIZE_MAP: Record<string, Record<string, string>> = {
+  "512": {
+    "1:1": "512x512", "16:9": "912x512", "9:16": "512x912",
+    "3:4": "512x680", "4:3": "680x512", "2:3": "512x768",
+    "3:2": "768x512", "4:5": "512x640", "5:4": "640x512",
+  },
+  "1K": {
+    "1:1": "1024x1024", "16:9": "1536x1024", "9:16": "1024x1536",
+    "3:4": "1024x1360", "4:3": "1360x1024", "2:3": "1024x1536",
+    "3:2": "1536x1024", "4:5": "1024x1280", "5:4": "1280x1024",
+  },
+  "2K": {
+    "1:1": "2048x2048", "16:9": "2560x1440", "9:16": "1440x2560",
+    "3:4": "1536x2048", "4:3": "2048x1536", "2:3": "1440x2160",
+    "3:2": "2160x1440", "4:5": "1536x1920", "5:4": "1920x1536",
+  },
+  "4K": {
+    "1:1": "4096x4096", "16:9": "4096x2304", "9:16": "2304x4096",
+    "3:4": "3072x4096", "4:3": "4096x3072", "2:3": "2736x4096",
+    "3:2": "4096x2736", "4:5": "3072x3840", "5:4": "3840x3072",
+  },
+};
+
+function openaiSize(modelId: string, aspectRatio: string, imageSize: string): string {
+  if (modelId === "gpt-image-2") {
+    return OPENAI_V2_SIZE_MAP[imageSize]?.[aspectRatio] ?? OPENAI_V2_SIZE_MAP["1K"][aspectRatio] ?? "1024x1024";
   }
-  // Default path — try primary, fall back to free-tier model on prepay error.
-  try {
-    const result = await callGeminiOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
-    return { ...result, modelUsed: MODEL_PRIMARY };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (isPrepayError(msg)) {
-      log(`  Prepay error on ${MODEL_PRIMARY} — falling back to ${MODEL_FALLBACK}. Original: ${msg.slice(0, 300)}`);
-      const result = await callGeminiOnce(MODEL_FALLBACK, inputParts, aspectRatio, imageSize);
-      return { ...result, modelUsed: MODEL_FALLBACK };
+  return OPENAI_V1_SIZE_MAP[aspectRatio] ?? "1024x1024";
+}
+
+function openaiQuality(imageSize: string): string {
+  if (imageSize === "2K" || imageSize === "4K") return "high";
+  return "medium";
+}
+
+class OpenAIProvider implements ImageProvider {
+  name = "openai";
+
+  async generate(req: GenerateRequest): Promise<ProviderResult> {
+    const size = openaiSize(req.modelId, req.aspectRatio, req.imageSize);
+    const quality = openaiQuality(req.imageSize);
+    const t0 = Date.now();
+    log(`  Calling OpenAI ${req.modelId} generate (${size}, quality=${quality})...`);
+
+    let res: Response;
+    try {
+      res = await fetch("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: req.modelId,
+          prompt: req.prompt,
+          n: 1,
+          size,
+          quality,
+        }),
+      });
+    } catch (fetchErr: unknown) {
+      throw new Error(`Network error calling OpenAI API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
     }
-    throw err;
+
+    const elapsed = Date.now() - t0;
+    log(`  OpenAI responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+
+    const rawBody = await res.text();
+    let data: { data?: Array<{ b64_json?: string }>; error?: { message: string } };
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`OpenAI API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+    }
+
+    if (!res.ok || data.error) {
+      throw new Error(`OpenAI API HTTP ${res.status}: ${data.error?.message ?? rawBody.slice(0, 2000)}`);
+    }
+
+    const imageBase64 = data.data?.[0]?.b64_json;
+    if (!imageBase64) {
+      throw new Error(`OpenAI returned no image data. Response: ${rawBody.slice(0, 2000)}`);
+    }
+
+    log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${req.modelId}`);
+    return { imageBase64, text: "", modelUsed: req.modelId };
+  }
+
+  async edit(req: EditRequest): Promise<ProviderResult> {
+    const size = openaiSize(req.modelId, req.aspectRatio, req.imageSize);
+    const quality = openaiQuality(req.imageSize);
+    const t0 = Date.now();
+    log(`  Calling OpenAI ${req.modelId} edit (${size}, quality=${quality})...`);
+
+    const imageBuffer = Buffer.from(req.imageBase64, "base64");
+    const imageBlob = new Blob([imageBuffer], { type: req.imageMime });
+
+    const form = new FormData();
+    form.append("model", req.modelId);
+    form.append("prompt", req.prompt);
+    form.append("image", imageBlob, "image.png");
+    form.append("size", size);
+    form.append("quality", quality);
+
+    let res: Response;
+    try {
+      res = await fetch("https://api.openai.com/v1/images/edits", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${OPENAI_API_KEY}` },
+        body: form,
+      });
+    } catch (fetchErr: unknown) {
+      throw new Error(`Network error calling OpenAI edit API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+    }
+
+    const elapsed = Date.now() - t0;
+    log(`  OpenAI edit responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+
+    const rawBody = await res.text();
+    let data: { data?: Array<{ b64_json?: string }>; error?: { message: string } };
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`OpenAI edit API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+    }
+
+    if (!res.ok || data.error) {
+      throw new Error(`OpenAI edit API HTTP ${res.status}: ${data.error?.message ?? rawBody.slice(0, 2000)}`);
+    }
+
+    const imageBase64 = data.data?.[0]?.b64_json;
+    if (!imageBase64) {
+      throw new Error(`OpenAI edit returned no image data. Response: ${rawBody.slice(0, 2000)}`);
+    }
+
+    log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${req.modelId} edit`);
+    return { imageBase64, text: "", modelUsed: req.modelId };
   }
 }
 
@@ -1296,7 +1548,7 @@ async function callVeo(
 
   let res: Response;
   try {
-    res = await fetch(`${VEO_ENDPOINT}?key=${API_KEY}`, {
+    res = await fetch(`${VEO_ENDPOINT}?key=${GOOGLE_API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1335,7 +1587,7 @@ async function callVeo(
   log(`  Veo operation started: ${operation.name}`);
 
   // Poll for completion
-  const pollUrl = `${VEO_BASE}/${operation.name}?key=${API_KEY}`;
+  const pollUrl = `${VEO_BASE}/${operation.name}?key=${GOOGLE_API_KEY}`;
   for (let i = 0; i < VEO_MAX_POLLS; i++) {
     await new Promise((r) => setTimeout(r, VEO_POLL_INTERVAL));
     const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
@@ -1372,7 +1624,7 @@ async function callVeo(
       log(`  Veo complete in ${((Date.now() - t0) / 1000).toFixed(1)}s, downloading video...`);
 
       // Download the video — append API key
-      const downloadRes = await fetch(`${videoUri}&key=${API_KEY}`, { redirect: "follow" });
+      const downloadRes = await fetch(`${videoUri}&key=${GOOGLE_API_KEY}`, { redirect: "follow" });
       if (!downloadRes.ok) {
         throw new Error(`Failed to download video (HTTP ${downloadRes.status})`);
       }
@@ -1392,7 +1644,8 @@ async function generateAndStore(
   imageSize: string,
   modelKey?: ModelKey
 ): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string; modelUsed: string }> {
-  const { imageBase64, text, modelUsed } = await callGemini([{ text: prompt }], aspectRatio, imageSize, modelKey);
+  const { provider, modelId } = getProvider(modelKey);
+  const { imageBase64, text, modelUsed } = await provider.generate({ prompt, aspectRatio, imageSize, modelId });
 
   const fullPng = Buffer.from(imageBase64, "base64");
   const id = randomUUID();
@@ -1416,15 +1669,15 @@ async function editAndStore(
   imageSize: string,
   modelKey?: ModelKey
 ): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string; modelUsed: string }> {
-  const { imageBase64, text, modelUsed } = await callGemini(
-    [
-      { text: prompt },
-      { inlineData: { mimeType: sourceMime, data: sourceBase64 } },
-    ],
+  const { provider, modelId } = getProvider(modelKey);
+  const { imageBase64, text, modelUsed } = await provider.edit({
+    prompt,
+    imageBase64: sourceBase64,
+    imageMime: sourceMime,
     aspectRatio,
     imageSize,
-    modelKey
-  );
+    modelId,
+  });
 
   const fullPng = Buffer.from(imageBase64, "base64");
   const id = randomUUID();
@@ -1449,21 +1702,24 @@ const AUTO_FALLBACK_NOTICE =
 /** Notice text when the user explicitly chose the free model. */
 const EXPLICIT_FREE_NOTICE =
   `\u2139\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image, free tier, as requested). ` +
-  `For higher-quality image generation, pass model='${DEFAULT_MODEL_KEY}' — this requires prepaid credits on your Google AI account.`;
+  `For higher-quality image generation, pass model='${GEMINI_DEFAULT}' — this requires prepaid credits on your Google AI account.`;
 
 const MODEL_PARAM_DESCRIPTION =
-  `Model to use. Default is '${DEFAULT_MODEL_KEY}' (${MODELS[DEFAULT_MODEL_KEY].label}, paid tier, highest quality). ` +
-  `Pass '${FALLBACK_MODEL_KEY}' (${MODELS[FALLBACK_MODEL_KEY].label}, free tier) for generations that don't require billing. ` +
-  `If omitted, the default model is used with automatic fallback to the free-tier model on prepay/billing errors.`;
+  `Model to use. Available: ${MODEL_KEYS.map(k => `'${k}' (${MODELS[k].label})`).join(", ")}. ` +
+  `Default: '${getDefaultModelKey()}'. Set DEFAULT_IMAGE_MODEL env var to change the default. ` +
+  `Gemini models fall back to free tier on billing errors. OpenAI requires OPENAI_API_KEY.`;
 
 function noticeFor(modelUsed: string, explicitModelKey?: ModelKey): string {
+  if (explicitModelKey && MODELS[explicitModelKey]?.provider !== "gemini") return "";
   if (modelUsed === MODEL_PRIMARY) return "";
   const notice = explicitModelKey ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE;
   return `\n\n${notice}`;
 }
 
-/** 2.5 Flash Image rejects "512" — auto-bump to "1K". */
 function resolveImageSize(imageSize: string, modelKey?: ModelKey): string {
+  if (!modelKey) return imageSize;
+  const entry = MODELS[modelKey];
+  if (entry?.provider !== "gemini") return imageSize;
   if (modelKey === "gemini-2.5-flash-image" && imageSize === "512") {
     log(`  Note: gemini-2.5-flash-image doesn't support image_size=512, using 1K instead`);
     return "1K";
@@ -1597,7 +1853,7 @@ server.tool(
 
 server.tool(
   "generate_images",
-  "Generate multiple images in parallel using Google's Nanobanana2 (Gemini 3.1 Flash Image). Returns the generated images and any accompanying text. Full-resolution images are viewable in the browser viewer.",
+  "Generate multiple images in parallel. Supports Gemini and OpenAI models — pass the model param to choose. Returns the generated images and any accompanying text. Full-resolution images are viewable in the browser viewer.",
   {
     prompts: z
       .array(z.string())
@@ -1645,7 +1901,7 @@ server.tool(
         const result = results[i];
         if (result.status === "fulfilled") {
           anySucceeded = true;
-          if (result.value.modelUsed !== MODEL_PRIMARY) anyFallback = true;
+          if (result.value.modelUsed !== MODEL_PRIMARY && isGeminiModel(result.value.modelUsed)) anyFallback = true;
           content.push({
             type: "text" as const,
             text: `Image ${i + 1}: ${result.value.filename}${result.value.text ? ` — ${result.value.text}` : ""}`,
@@ -1686,7 +1942,7 @@ server.tool(
 
 server.tool(
   "generate_image",
-  "Generate a single image using Google's Nanobanana2 (Gemini 3.1 Flash Image). Full-resolution image is viewable in the browser viewer.",
+  "Generate a single image. Supports Gemini and OpenAI models — pass the model param to choose. Full-resolution image is viewable in the browser viewer.",
   {
     prompt: z.string().describe("Text prompt describing the image to generate"),
     aspect_ratio: z
@@ -1788,7 +2044,7 @@ server.tool(
 
 server.tool(
   "edit_image",
-  `Edit an existing image using Google's Nanobanana2 (Gemini 3.1 Flash Image). Provide the filename of an image in ${SAVE_DIR} (use list_images to see available files, or save_image to import one first). The MCP reads the file directly — do NOT pass base64 image data.`,
+  `Edit an existing image. Supports Gemini and OpenAI models — pass the model param to choose. Provide the filename of an image in ${SAVE_DIR} (use list_images to see available files, or save_image to import one first). The MCP reads the file directly — do NOT pass base64 image data.`,
   {
     prompt: z.string().describe("Text prompt describing the edits to make to the image"),
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR} (e.g. "2026-03-17T17-47-31-152Z_59f735df.png")`),
@@ -1848,7 +2104,7 @@ server.tool(
 
 server.tool(
   "fix_image",
-  `Fix an image that has glitched or garbled text by splitting it into tiles, re-rendering each tile through Gemini, and stitching them back together. This works because smaller sections have less text for the model to handle at once. Use this when a generated image has text artifacts or overloaded text regions.`,
+  `Fix an image that has glitched or garbled text by splitting it into tiles, re-rendering each tile, and stitching them back together. This works because smaller sections have less text for the model to handle at once. Use this when a generated image has text artifacts or overloaded text regions.`,
   {
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
     prompt: z
@@ -1862,9 +2118,10 @@ server.tool(
     image_size: z
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
-      .describe("Resolution for each tile's Gemini call"),
+      .describe("Resolution for each tile"),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ filename, prompt, grid, image_size }) => {
+  async ({ filename, prompt, grid, image_size, model }) => {
     try {
       await ensureViewer();
       log(`fix_image: source=${filename} grid=${grid}`);
@@ -1912,11 +2169,11 @@ server.tool(
       );
       log(`  Tile aspect ~${tileAspect.toFixed(2)}, using ${bestAspect.label}`);
 
-      // Send each tile to Gemini in parallel
+      // Send each tile to the provider in parallel
+      const { provider: tileProvider, modelId: tileModelId } = getProvider(model);
       const fixResults = await Promise.allSettled(
         tiles.map(async (tile, i) => {
-          log(`  [tile ${i + 1}/${tiles.length}] sending to Gemini...`);
-          // Compress tile for Gemini
+          log(`  [tile ${i + 1}/${tiles.length}] sending to ${tileProvider.name}...`);
           const tileSharp = sharp(tile.buffer);
           const tileMeta = await tileSharp.metadata();
           let sendBuf: Buffer;
@@ -1929,14 +2186,14 @@ server.tool(
             sendMime = "image/png";
           }
 
-          const { imageBase64, modelUsed } = await callGemini(
-            [
-              { text: prompt },
-              { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
-            ],
-            bestAspect.label,
-            image_size
-          );
+          const { imageBase64, modelUsed } = await tileProvider.edit({
+            prompt,
+            imageBase64: sendBuf.toString("base64"),
+            imageMime: sendMime,
+            aspectRatio: bestAspect.label,
+            imageSize: image_size,
+            modelId: tileModelId,
+          });
 
           return { col: tile.col, row: tile.row, buffer: Buffer.from(imageBase64, "base64"), modelUsed };
         })
@@ -2093,7 +2350,7 @@ function snapToAspectRatio(
 
 server.tool(
   "fix_region",
-  `Fix a specific region of an image by cropping it out, sending it to Gemini for repair, and reinserting it. The crop is automatically snapped to the nearest Gemini-supported aspect ratio. Use this when only part of an image has glitched text or artifacts — more precise than fix_image's grid approach.`,
+  `Fix a specific region of an image by cropping it out, sending it for repair, and reinserting it. The crop is automatically snapped to the nearest supported aspect ratio. Use this when only part of an image has glitched text or artifacts — more precise than fix_image's grid approach.`,
   {
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
     prompt: z
@@ -2107,9 +2364,10 @@ server.tool(
     image_size: z
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
-      .describe("Resolution for the Gemini call on the cropped region"),
+      .describe("Resolution for the cropped region"),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ filename, prompt, x, y, width, height, image_size }) => {
+  async ({ filename, prompt, x, y, width, height, image_size, model }) => {
     try {
       await ensureViewer();
       log(`fix_region: source=${filename} region=(${x}%,${y}%,${width}%,${height}%)`);
@@ -2150,15 +2408,15 @@ server.tool(
         sendMime = "image/png";
       }
 
-      // Send to Gemini
-      const { imageBase64, modelUsed } = await callGemini(
-        [
-          { text: prompt },
-          { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
-        ],
-        snapped.aspectLabel,
-        image_size
-      );
+      const { provider: regionProvider, modelId: regionModelId } = getProvider(model);
+      const { imageBase64, modelUsed } = await regionProvider.edit({
+        prompt,
+        imageBase64: sendBuf.toString("base64"),
+        imageMime: sendMime,
+        aspectRatio: snapped.aspectLabel,
+        imageSize: image_size,
+        modelId: regionModelId,
+      });
 
       // Resize fixed region back to exact pixel dimensions of the snapped crop
       let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
@@ -2219,15 +2477,16 @@ server.tool(
 
 server.tool(
   "interactive_fix",
-  `Opens an image in a browser-based crop tool where the user can draw a rectangle around the region to fix, add notes/instructions, and submit. The tool waits for the user's selection, then sends the cropped region to Gemini for repair and composites it back into the original image. Best for precise, user-guided fixes.`,
+  `Opens an image in a browser-based crop tool where the user can draw a rectangle around the region to fix, add notes/instructions, and submit. The tool waits for the user's selection, then sends the cropped region for repair and composites it back into the original image. Best for precise, user-guided fixes.`,
   {
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
     image_size: z
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
-      .describe("Resolution for the Gemini call on the cropped region"),
+      .describe("Resolution for the cropped region"),
+    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ filename, image_size }) => {
+  async ({ filename, image_size, model }) => {
     let completeResolve!: (val: CropResult) => void;
     try {
       await ensureViewer();
@@ -2283,19 +2542,19 @@ server.tool(
 
       const prompt = submission.prompt || "Clean up and fix any garbled, glitched, or distorted text. Preserve the style, colors, and layout exactly.";
       const shots = submission.shots || 1;
-      log(`  Firing ${shots} parallel Gemini call(s)...`);
+      const { provider: fixProvider, modelId: fixModelId } = getProvider(model);
+      log(`  Firing ${shots} parallel ${fixProvider.name} call(s)...`);
 
-      // Fire N parallel Gemini calls
       const geminiResults = await Promise.allSettled(
         Array.from({ length: shots }, (_, i) =>
-          callGemini(
-            [
-              { text: prompt },
-              { inlineData: { mimeType: sendMime, data: sendBuf.toString("base64") } },
-            ],
-            snapped.aspectLabel,
-            image_size
-          ).then(async ({ imageBase64, modelUsed }) => {
+          fixProvider.edit({
+            prompt,
+            imageBase64: sendBuf.toString("base64"),
+            imageMime: sendMime,
+            aspectRatio: snapped.aspectLabel,
+            imageSize: image_size,
+            modelId: fixModelId,
+          }).then(async ({ imageBase64, modelUsed }) => {
             // Resize, histogram match, and composite each result
             let fixedRegion = await sharp(Buffer.from(imageBase64, "base64"))
               .resize(snapped.width, snapped.height, { fit: "fill" })
@@ -2482,6 +2741,19 @@ async function ensureViewer() {
 }
 
 async function main() {
+  if (GOOGLE_API_KEY) {
+    providers["gemini"] = new GeminiProvider();
+    log("Gemini provider available");
+  }
+  if (OPENAI_API_KEY) {
+    providers["openai"] = new OpenAIProvider();
+    log("OpenAI provider available");
+  }
+  if (!GOOGLE_API_KEY && !OPENAI_API_KEY) {
+    log("WARNING: Neither GOOGLE_API_KEY nor OPENAI_API_KEY is set. No image providers available.");
+  }
+  log(`Default model: ${getDefaultModelKey()}`);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log("MCP server running on stdio");
