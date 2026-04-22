@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { randomUUID } from "crypto";
 import { writeFile, readFile, mkdir, readdir, copyFile, stat } from "fs/promises";
+import { readFileSync } from "fs";
 import { join, basename, extname } from "path";
 import { homedir } from "os";
 
@@ -29,8 +30,20 @@ function openExternal(target: string): void {
   });
 }
 
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY ?? "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
+function loadKeysFromClaudeConfig(): { google: string; openai: string } {
+  try {
+    const configPath = join(homedir(), ".claude.json");
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    const env = config?.mcpServers?.["pixel-surgeon"]?.env ?? {};
+    return { google: env.GOOGLE_API_KEY ?? "", openai: env.OPENAI_API_KEY ?? "" };
+  } catch {
+    return { google: "", openai: "" };
+  }
+}
+
+const _claudeKeys = (!process.env.GOOGLE_API_KEY && !process.env.OPENAI_API_KEY) ? loadKeysFromClaudeConfig() : { google: "", openai: "" };
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || _claudeKeys.google;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || _claudeKeys.openai;
 
 // --- Provider abstraction ---
 
