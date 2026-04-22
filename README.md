@@ -6,12 +6,13 @@
 
 <p align="center">
   <strong>MCP server for AI image &amp; video generation, editing, and transplant-grade region repair</strong><br/>
-  Powered by Gemini 3.1 Flash Image and Veo 3
+  Powered by Gemini 3.1 Flash Image, OpenAI GPT Image 2, and Veo 3
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-stdio-blue" alt="MCP stdio" />
   <img src="https://img.shields.io/badge/Gemini_3.1-Flash_Image-4285F4?logo=google" alt="Gemini" />
+  <img src="https://img.shields.io/badge/GPT_Image_2-OpenAI-412991?logo=openai&logoColor=white" alt="OpenAI" />
   <img src="https://img.shields.io/badge/Veo_3-Video-34A853?logo=google" alt="Veo 3" />
   <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
 </p>
@@ -22,14 +23,23 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP c
 
 ## How it works
 
-Google's image generation pipeline (internally called "nanobanana2") uses a two-stage approach:
+pixel-surgeon-mcp is a **multi-provider** image generation server. You can use either or both providers, and switch between them per-request:
 
-1. **Gemini 3.1 Pro** reasons about your prompt (text)
-2. **Gemini 3.1 Flash Image** renders the pixels
+### Gemini (Google)
 
-For video, the server calls **Veo 3** with async polling — generating both video and ambient audio.
+Google's image generation pipeline uses a two-stage approach: **Gemini 3.1 Pro** reasons about your prompt, then **Gemini 3.1 Flash Image** renders the pixels. Supports 9 aspect ratios at 512/1K/2K/4K resolution.
 
-Flash struggles with text-heavy images. The fix tools solve this by sending smaller regions to Gemini, then stitching the results back with histogram-matched compositing for seamless blending.
+### OpenAI GPT Image 2
+
+OpenAI's latest image model with dramatically improved text rendering and visual fidelity. Supports flexible resolutions — pixel-surgeon maps your chosen size and aspect ratio to the optimal pixel dimensions automatically. Quality levels: `medium` (fast) and `high` (print-ready). **Excellent for infographics, diagrams, and text-heavy images** where Gemini models struggle.
+
+### Veo 3 (Video)
+
+For video, the server calls **Veo 3** with async polling — generating both video and ambient audio. Supports 16:9 and 9:16 at 5s or 8s duration.
+
+### Region repair
+
+AI image models struggle with text-heavy images. The fix tools solve this by sending smaller regions to the provider, then stitching the results back with histogram-matched compositing for seamless blending.
 
 ## Tools
 
@@ -44,26 +54,22 @@ Flash struggles with text-heavy images. The fix tools solve this by sending smal
 | `interactive_fix` | Browser-based crop UI with multi-shot selection |
 | `list_images` | List generated images and videos |
 | `save_image` | Import an external image into the workspace |
+| `remove_background` | Remove image background (alpha channel transparency) |
 
-## Models & automatic fallback
+## Models
 
-By default the server uses **`gemini-3.1-flash-image`** (the paid-tier "nanobanana2" model), which supports `512`, `1K`, `2K`, and `4K` output.
+| Model | Provider | Resolution | Best for |
+|-------|----------|-----------|----------|
+| `gemini-3.1-flash-image` | Google | 512 / 1K / 2K / 4K | General image generation, photo-realistic scenes |
+| `gemini-2.5-flash-image` | Google | 1K max (free tier) | Quick drafts, prototyping |
+| `gpt-image-2` | OpenAI | Flexible (up to 4K) | Text-heavy images, infographics, diagrams, typography |
+| `gpt-image-1` | OpenAI | 3 fixed sizes | Legacy support |
 
-If a generation call fails with a billing / prepay error (e.g. your API project has no credits), the server automatically retries on the free-tier **`gemini-2.5-flash-image`** model so your request still succeeds. When this happens the viewer shows a yellow banner on the affected image so you know it came from the fallback.
+Force a specific model per-call via the `model` tool parameter, or set `DEFAULT_IMAGE_MODEL` env var.
 
-Free-tier `gemini-2.5-flash-image` has notable constraints to be aware of:
+### Gemini automatic fallback
 
-| Limit | Value |
-|---|---|
-| Max resolution | **1K** (1024px) — 2K/4K not supported |
-| Requests per minute | 10 RPM |
-| Requests per day | **500 RPD** |
-| Tokens per minute | ~250k TPM |
-| Quota reset | Midnight Pacific Time |
-
-Free-tier quotas are **per Google Cloud project**, not per API key, so additional keys in the same project don't increase your limit. If you request `2K` or `4K` while the fallback is active, the call will fail — use `1K` to stay inside free-tier capabilities, or top up credits on your paid project to get full `gemini-3.1-flash-image` access back.
-
-You can also force a specific model per-call via the `model` tool parameter.
+If a Gemini generation call fails with a billing / prepay error, the server automatically retries on the free-tier **`gemini-2.5-flash-image`** model. The viewer shows a yellow banner when this happens. Free-tier limits: 1K max resolution, 10 RPM, 500 RPD.
 
 ## Style presets
 
@@ -91,14 +97,26 @@ Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric 
 
 ## Setup
 
-### Get a Google AI API key
+### Get your API key(s)
+
+You need at least one provider API key. You can use both for maximum flexibility.
+
+#### Google (Gemini + Veo 3)
 
 1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
 2. Sign in with your Google account
 3. Click **Create API Key** and copy it
-4. The key needs access to **Gemini 3.1 Flash Image** (image generation) and optionally **Veo 3** (video generation)
 
-> ⚠️ **Prepayment required.** Google does not offer a free tier for Gemini 3.1 Flash Image or Veo 3. You must enable billing and prepay credits on your Google AI account before these models will respond. See [Google AI pricing](https://ai.google.dev/pricing) for current rates.
+> **Prepayment required.** Gemini 3.1 Flash Image and Veo 3 require billing and prepaid credits. The free-tier fallback (2.5 Flash) has limited resolution and rate limits. See [Google AI pricing](https://ai.google.dev/pricing).
+
+#### OpenAI (GPT Image 2)
+
+1. Go to [OpenAI API](https://platform.openai.com/api-keys)
+2. Sign in or create an account
+3. Click **Create new secret key** and copy it
+4. Ensure you have API credits — image generation is billed per request
+
+> GPT Image 2 excels at text rendering, infographics, and diagrams. If you primarily need text-heavy images, this is the provider to use.
 
 ### Prerequisites
 
@@ -115,25 +133,35 @@ npm run build
 
 ### Configure your MCP client
 
-Add to your Claude Code or Claude Desktop config:
+Add to your Claude Code or Claude Desktop config. Include whichever API keys you have:
 
 ```json
 {
   "mcpServers": {
-    "nanobanana2": {
+    "pixel-surgeon": {
       "command": "node",
       "args": ["/path/to/pixel-surgeon-mcp/dist/index.js"],
       "env": {
-        "GOOGLE_API_KEY": "your-api-key-here"
+        "GOOGLE_API_KEY": "your-google-api-key",
+        "OPENAI_API_KEY": "your-openai-api-key"
       }
     }
   }
 }
 ```
 
+Or via the Claude Code CLI:
+
+```bash
+claude mcp add pixel-surgeon \
+  -e GOOGLE_API_KEY=your-google-key \
+  -e OPENAI_API_KEY=your-openai-key \
+  -- node /path/to/pixel-surgeon-mcp/dist/index.js
+```
+
 ### Image output
 
-Generated images are saved to `~/Pictures/nanobanana2/`. A local browser viewer auto-launches on first use for full-resolution previews.
+Generated images are saved to `~/Pictures/pixel-surgeon/`. A local browser viewer auto-launches on first use for full-resolution previews with model selection, respin controls, and search.
 
 ## Development
 
@@ -164,7 +192,7 @@ Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should incl
 
 ### Model adapters
 
-Currently pixel-surgeon-mcp is wired to Gemini 3.1 Flash Image and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, DALL-E, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
+The server currently supports Gemini, OpenAI, and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
 
 ## Built by Duval Software
 

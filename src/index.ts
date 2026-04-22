@@ -522,25 +522,31 @@ function viewerHtml(): string {
         : "";
       const curSize = img.imageSize ?? "1K";
       const curAspect = img.aspectRatio ?? "1:1";
+      const curModel = img.modelUsed ?? "";
       const sizeOpts = RESPIN_SIZES.map(s => `<option value="${s}"${s === curSize ? " selected" : ""}>${s}</option>`).join("");
       const aspectOpts = RESPIN_ASPECTS.map(a => `<option value="${a}"${a === curAspect ? " selected" : ""}>${a}</option>`).join("");
+      const modelOpts = MODEL_KEYS.map(k => `<option value="${k}"${MODELS[k].id === curModel ? " selected" : ""}>${esc(MODELS[k].label)}</option>`).join("");
       return `<div class="img-entry" id="img-${img.id}">
           <div class="prompt-row">
             <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
             <div class="respin-controls">
               <select class="respin-select" data-size="${img.id}" title="Resolution">${sizeOpts}</select>
               <select class="respin-select" data-aspect="${img.id}" title="Aspect ratio">${aspectOpts}</select>
+              <select class="respin-select" data-model="${img.id}" title="Model">${modelOpts}</select>
               <button class="respin-btn" onclick="respin('${img.id}', this)" title="Regenerate (edit prompt / size / aspect above)">&#x21bb; Respin</button>
             </div>
           </div>
           ${fallbackBanner}
-          <img src="/img/${img.id}" />
+          <div class="img-wrapper">
+            <span class="model-label">${esc(curModel)}</span>
+            <img src="/img/${img.id}" />
+          </div>
         </div>`;
     })
     .join("\n");
 
   return `<!DOCTYPE html>
-<html><head><title>Nanobanana2</title>
+<html><head><title>pixel-surgeon-mcp</title>
 <style>
   body { margin: 20px; background: #1a1a1a; color: #ccc; font-family: system-ui; }
   img { max-width: 100%; }
@@ -560,6 +566,8 @@ function viewerHtml(): string {
   .respin-btn:hover { background: #3a6a9b; color: #fff; }
   .respin-btn:disabled { opacity: 0.5; cursor: wait; }
   .video-badge { background: #6b2a2a; color: #ff8b8b; border: 1px solid #9b3a3a; padding: 8px 16px; font-size: 11px; font-family: system-ui; border-radius: 4px; white-space: nowrap; align-self: flex-start; font-weight: 600; letter-spacing: 0.5px; }
+  .img-wrapper { position: relative; }
+  .model-label { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #8bc4ff; padding: 3px 8px; font-size: 11px; font-family: monospace; border-radius: 3px; z-index: 1; pointer-events: none; }
   .fallback-banner { background: #3a2e12; color: #f0c066; border: 1px solid #7a5c20; padding: 8px 12px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
   .fallback-banner a { color: #ffd988; text-decoration: underline; }
   .fallback-banner strong { color: #ffdf9e; }
@@ -604,6 +612,7 @@ const es = new EventSource("/events");
 const PRIMARY_MODEL = ${JSON.stringify(MODEL_PRIMARY)};
 const RESPIN_SIZES = ${JSON.stringify(RESPIN_SIZES)};
 const RESPIN_ASPECTS = ${JSON.stringify(RESPIN_ASPECTS)};
+const MODEL_OPTIONS = ${JSON.stringify(MODEL_KEYS.map(k => ({ key: k, label: MODELS[k].label, id: MODELS[k].id })))};
 es.onmessage = (e) => {
   const data = JSON.parse(e.data);
   const { id, prompt, type, filename, modelUsed } = data;
@@ -669,8 +678,19 @@ es.onmessage = (e) => {
     btn.innerHTML = "&#x21bb; Respin";
     btn.title = "Regenerate (edit prompt / size / aspect above)";
     btn.onclick = function() { respin(id, this); };
+    const modelSel = document.createElement("select");
+    modelSel.className = "respin-select";
+    modelSel.dataset.model = id;
+    modelSel.title = "Model";
+    MODEL_OPTIONS.forEach(function(m) {
+      const o = document.createElement("option");
+      o.value = m.key; o.textContent = m.label;
+      if (m.id === modelUsed) o.selected = true;
+      modelSel.appendChild(o);
+    });
     controls.appendChild(sizeSel);
     controls.appendChild(aspectSel);
+    controls.appendChild(modelSel);
     controls.appendChild(btn);
     row.appendChild(ta);
     row.appendChild(controls);
@@ -681,9 +701,16 @@ es.onmessage = (e) => {
       banner.innerHTML = '\u26A0\uFE0F Generated with <strong>' + modelUsed + '</strong> (free-tier fallback). Upgrade to <strong>' + PRIMARY_MODEL + '</strong> for higher-quality imagegen \u2014 <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.';
       div.appendChild(banner);
     }
+    const wrapper = document.createElement("div");
+    wrapper.className = "img-wrapper";
+    const label = document.createElement("span");
+    label.className = "model-label";
+    label.textContent = modelUsed || "";
+    wrapper.appendChild(label);
     const img = document.createElement("img");
     img.src = "/img/" + id;
-    div.appendChild(img);
+    wrapper.appendChild(img);
+    div.appendChild(wrapper);
   }
   gallery.prepend(div);
 };
@@ -694,10 +721,12 @@ async function respin(id, btn) {
   const prompt = ta ? ta.value : undefined;
   const sizeEl = document.querySelector('select[data-size="' + id + '"]');
   const aspectEl = document.querySelector('select[data-aspect="' + id + '"]');
+  const modelEl = document.querySelector('select[data-model="' + id + '"]');
   const size = sizeEl ? sizeEl.value : undefined;
   const aspect = aspectEl ? aspectEl.value : undefined;
+  const model = modelEl ? modelEl.value : undefined;
   try {
-    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, prompt, size, aspect }) });
+    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, prompt, size, aspect, model }) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Respin failed");
     btn.textContent = "\u21bb Respin";
@@ -814,8 +843,19 @@ function renderHistoryItems(items) {
     btn.innerHTML = "&#x21bb; Respin";
     btn.title = "Regenerate and switch to Live tab";
     btn.onclick = function () { respinHistory(key, this); };
+    const modelSel = document.createElement("select");
+    modelSel.className = "respin-select";
+    modelSel.dataset.histModel = key;
+    modelSel.title = "Model";
+    MODEL_OPTIONS.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.key; o.textContent = m.label;
+      if (m.id === (it.modelUsed || "")) o.selected = true;
+      modelSel.appendChild(o);
+    });
     controls.appendChild(sizeSel);
     controls.appendChild(aspectSel);
+    controls.appendChild(modelSel);
     controls.appendChild(btn);
     row.appendChild(ta);
     row.appendChild(controls);
@@ -824,13 +864,20 @@ function renderHistoryItems(items) {
     metaDiv.className = "history-meta";
     metaDiv.textContent = (it.filename || "") + " · " + meta;
 
+    const wrapper = document.createElement("div");
+    wrapper.className = "img-wrapper";
+    const label = document.createElement("span");
+    label.className = "model-label";
+    label.textContent = it.modelUsed || "";
+    wrapper.appendChild(label);
     const img = document.createElement("img");
     img.src = "/file/" + encodeURIComponent(key);
     img.loading = "lazy";
+    wrapper.appendChild(img);
 
     div.appendChild(row);
     div.appendChild(metaDiv);
-    div.appendChild(img);
+    div.appendChild(wrapper);
     gallery.appendChild(div);
   }
 }
@@ -841,9 +888,11 @@ async function respinHistory(key, btn) {
   const ta = document.querySelector('textarea[data-hist-id="' + key + '"]');
   const sizeEl = document.querySelector('select[data-hist-size="' + key + '"]');
   const aspectEl = document.querySelector('select[data-hist-aspect="' + key + '"]');
+  const modelEl = document.querySelector('select[data-hist-model="' + key + '"]');
   const prompt = ta ? ta.value : undefined;
   const size = sizeEl ? sizeEl.value : undefined;
   const aspect = aspectEl ? aspectEl.value : undefined;
+  const model = modelEl ? modelEl.value : undefined;
   if (!prompt || !prompt.trim()) {
     btn.textContent = "Need prompt";
     btn.disabled = false;
@@ -854,7 +903,7 @@ async function respinHistory(key, btn) {
     const res = await fetch("/respin", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, size, aspect }),
+      body: JSON.stringify({ prompt, size, aspect, model }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Respin failed");
