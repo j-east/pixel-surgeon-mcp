@@ -9,6 +9,9 @@ import { writeFile, readFile, mkdir, readdir, copyFile, stat } from "fs/promises
 import { readFileSync } from "fs";
 import { join, extname } from "path";
 import { homedir } from "os";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const potrace = require("potrace");
 const SAVE_DIR = join(homedir(), "Pictures", "pixel-surgeon");
 /** Platform-aware "open URL/path in default app" with fallback chain for Linux */
 function openExternal(target) {
@@ -117,6 +120,7 @@ const imageStore = [];
 const videoStore = [];
 let viewerPort = null;
 const sseClients = new Set();
+let lastPrompt = "";
 const pendingSelections = new Map();
 const pendingCrops = new Map();
 function notifyViewerClients(img) {
@@ -426,6 +430,14 @@ function viewerHtml() {
         </div>`;
     })
         .join("\n");
+    const latestImage = items.find(i => i.type === "image")?.data;
+    const topSize = latestImage?.imageSize ?? "1K";
+    const topAspect = latestImage?.aspectRatio ?? "1:1";
+    const topModel = latestImage?.modelUsed ?? "";
+    const topPrompt = latestImage?.prompt ?? lastPrompt;
+    const topSizeOpts = RESPIN_SIZES.map(s => `<option value="${s}"${s === topSize ? " selected" : ""}>${s}</option>`).join("");
+    const topAspectOpts = RESPIN_ASPECTS.map(a => `<option value="${a}"${a === topAspect ? " selected" : ""}>${a}</option>`).join("");
+    const topModelOpts = MODEL_KEYS.map(k => `<option value="${k}"${MODELS[k].id === topModel ? " selected" : ""}>${esc(MODELS[k].label)}</option>`).join("");
     return `<!DOCTYPE html>
 <html><head><title>pixel-surgeon-mcp</title>
 <style>
@@ -438,6 +450,7 @@ function viewerHtml() {
   #empty { display: ${items.length === 0 ? "block" : "none"}; }
   #open-folder { background: #333; color: #ccc; border: 1px solid #555; padding: 8px 16px; cursor: pointer; font-size: 14px; font-family: system-ui; margin-bottom: 20px; }
   #open-folder:hover { background: #444; }
+  #top-prompt { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #333; }
   .prompt-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
   .prompt-edit { flex: 1; background: #252525; color: #bbb; border: 1px solid #444; padding: 8px; font-size: 13px; font-family: system-ui; border-radius: 4px; resize: vertical; min-height: 48px; line-height: 1.4; }
   .prompt-edit:focus { border-color: #3a6a9b; color: #ddd; outline: none; }
@@ -476,8 +489,19 @@ function viewerHtml() {
   <button class="tab-btn" data-tab="history" onclick="switchTab('history')">History</button>
 </div>
 <div class="tab-pane active" id="tab-live">
+  <div id="top-prompt">
+    <div class="prompt-row">
+      <textarea class="prompt-edit" id="top-prompt-text" placeholder="Describe an image to generate...">${esc(topPrompt)}</textarea>
+      <div class="respin-controls">
+        <select class="respin-select" id="top-size" title="Resolution">${topSizeOpts}</select>
+        <select class="respin-select" id="top-aspect" title="Aspect ratio">${topAspectOpts}</select>
+        <select class="respin-select" id="top-model" title="Model">${topModelOpts}</select>
+        <button class="respin-btn" id="top-generate-btn" onclick="generateFromTop(this)">&#x2728; Generate</button>
+      </div>
+    </div>
+  </div>
   <button id="open-folder" onclick="fetch('/open-folder',{method:'POST'})">Open in Finder</button>
-  <p id="empty">Waiting for images...</p>
+  <p id="empty">No images yet — type a prompt above to get started.</p>
   <div id="gallery">${itemTags}</div>
 </div>
 <div class="tab-pane" id="tab-history">
@@ -500,6 +524,10 @@ es.onmessage = (e) => {
   const data = JSON.parse(e.data);
   const { id, prompt, type, filename, modelUsed } = data;
   empty.style.display = "none";
+  if (type !== "video") {
+    const topTa = document.getElementById("top-prompt-text");
+    if (topTa) topTa.value = "";
+  }
   const div = document.createElement("div");
   div.className = "img-entry";
 
@@ -613,6 +641,27 @@ async function respin(id, btn) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Respin failed");
     btn.textContent = "\u21bb Respin";
+    btn.disabled = false;
+  } catch (err) {
+    btn.textContent = "Failed — retry?";
+    btn.disabled = false;
+  }
+}
+
+async function generateFromTop(btn) {
+  const ta = document.getElementById("top-prompt-text");
+  const prompt = ta ? ta.value.trim() : "";
+  if (!prompt) { ta && ta.focus(); return; }
+  btn.disabled = true;
+  btn.textContent = "Generating...";
+  const size = document.getElementById("top-size").value;
+  const aspect = document.getElementById("top-aspect").value;
+  const model = document.getElementById("top-model").value;
+  try {
+    const res = await fetch("/respin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, size, aspect, model }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Generate failed");
+    btn.innerHTML = "&#x2728; Generate";
     btn.disabled = false;
   } catch (err) {
     btn.textContent = "Failed — retry?";
@@ -1462,6 +1511,7 @@ async function callVeo(prompt, aspectRatio, durationSeconds) {
 }
 /** Generate, store, return shrunk for MCP */
 async function generateAndStore(prompt, aspectRatio, imageSize, modelKey) {
+    lastPrompt = prompt;
     const { provider, modelId } = getProvider(modelKey);
     const { imageBase64, text, modelUsed } = await provider.generate({ prompt, aspectRatio, imageSize, modelId });
     const fullPng = Buffer.from(imageBase64, "base64");
@@ -1530,22 +1580,22 @@ function resolveImageSize(imageSize, modelKey) {
 const STYLE_PRESETS = {
     "neo-brutalist": {
         description: "Neo-brutalist minimalist magazine editorial. Bold oversized typography, cream/black/terracotta palette, halftone textures, visible grid lines, asymmetric layout. Think Emigre meets Swiss brutalism.",
-        promptPrefix: "Neo-brutalist minimalist design. Magazine editorial style layout. Off-white / cream background with bold black typography in a heavy-weight grotesque sans-serif font, slightly overlapping and breaking the grid. Accent color: muted burnt orange or terracotta used sparingly as stripe or block elements. Raw, unpolished aesthetic — visible grid lines, asymmetric layout, oversized type that bleeds off edges. Subtle halftone texture overlay. Monospaced subtext in lowercase. No gradients, no glossy effects, no heavy saturation. Clean but edgy, restrained but bold.",
+        promptPrefix: "Neo-brutalist minimalist design. Magazine editorial style layout. Off-white / cream background with bold black typography in a heavy-weight grotesque sans-serif font, slightly overlapping and breaking the grid. Accent color: muted burnt orange or terracotta used sparingly as stripe or block elements. Raw, unpolished aesthetic — visible grid lines, asymmetric layout, oversized type that bleeds off edges. Subtle halftone texture overlay. Monospaced subtext in lowercase. No gradients, no glossy effects, no heavy saturation. Clean but edgy, restrained but bold. In the bottom-right corner, include very small, barely visible text reading 'John Evans — Duval Software' in a muted tone that nearly blends into the background.",
         defaultAspectRatio: "4:5",
     },
     "neo-retro-futurism": {
         description: "Neo-retro-futurism blending 1960s Space Age optimism with 1980s video game aesthetics. Cathode blue, warm amber, salmon red, warm green palette. Scanlines, pixel hints, and atomic-age geometry.",
-        promptPrefix: "Neo-retro-futurism style. Blend of 1960s Space Age futurism and 1980s video game aesthetics with a modern neo-retro sensibility. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff glowing CRT blue), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a to #ff6b6b), and warm muted greens (#5a8a5c to #8bbd7b). Dark background evoking a CRT monitor with subtle scanline texture and faint phosphor glow. Typography: mix of retrofuturist geometric sans-serif (like Eurostile, Microgramma, or Bank Gothic) with pixel-grid or bitmap-style secondary text. Design elements: atomic-age starbursts, orbital ellipses, rounded-rectangle pods, jet-age swooshes, and subtle 8-bit pixel patterns along borders or dividers. Faint CRT curvature vignette at edges. Thin vector grid lines receding to a vanishing point. Icons and illustrations should feel like arcade cabinet art meets Googie architecture meets NASA mission patches. Warm analog glow on all light sources — no harsh pure whites, everything filtered through amber or blue phosphor. The overall mood is optimistic, adventurous, and slightly nostalgic — a future that never was, rendered through a cathode ray tube.",
+        promptPrefix: "Neo-retro-futurism style. Blend of 1960s Space Age futurism and 1980s video game aesthetics with a modern neo-retro sensibility. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff glowing CRT blue), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a to #ff6b6b), and warm muted greens (#5a8a5c to #8bbd7b). Dark background evoking a CRT monitor with subtle scanline texture and faint phosphor glow. Typography: mix of retrofuturist geometric sans-serif (like Eurostile, Microgramma, or Bank Gothic) with pixel-grid or bitmap-style secondary text. Design elements: atomic-age starbursts, orbital ellipses, rounded-rectangle pods, jet-age swooshes, and subtle 8-bit pixel patterns along borders or dividers. Faint CRT curvature vignette at edges. Thin vector grid lines receding to a vanishing point. Icons and illustrations should feel like arcade cabinet art meets Googie architecture meets NASA mission patches. Warm analog glow on all light sources — no harsh pure whites, everything filtered through amber or blue phosphor. The overall mood is optimistic, adventurous, and slightly nostalgic — a future that never was, rendered through a cathode ray tube. In the bottom-right corner, include very small, barely visible text reading 'John Evans — Duval Software' in a dim phosphor glow that nearly fades into the CRT background.",
         defaultAspectRatio: "4:5",
     },
     "fractal-arcade": {
         description: "Geometric dithered fractal style. All shading via dithering patterns and geometric cross-hatch grids — no smooth gradients. Fractal backgrounds (Sierpinski, hexagonal tessellations, recursive diamonds), low-poly faceted subjects, retro CRT palette.",
-        promptPrefix: "Geometric dithered illustration style. All shading done through dithering patterns, halftone dots, and geometric cross-hatch grids — NO smooth gradients anywhere. Every surface rendered with visible pixel-level dithering like a 16-color EGA/VGA palette pushed through ordered Bayer matrix dithering. Fractal geometric patterns in the background — Sierpinski triangles, hexagonal tessellations, recursive diamond grids. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a), warm muted greens (#5a8a5c). Subjects built from clean geometric shapes — triangular facets, polygonal planes, like a low-poly render but flat and 2D with dithered color fills instead of smooth shading. Think: Saul Bass designed a character select screen for an Amiga game. Geometric line-art icons. Chunky retrofuturist typeface for headers, smaller geometric caps for subtitles. Horizontal scanline overlay. No photorealism, no soft shadows, no AI-gradient smoothness. Every color transition is a hard dither pattern. Clean, precise, geometric, but retro-cool.",
+        promptPrefix: "Geometric dithered illustration style. All shading done through dithering patterns, halftone dots, and geometric cross-hatch grids — NO smooth gradients anywhere. Every surface rendered with visible pixel-level dithering like a 16-color EGA/VGA palette pushed through ordered Bayer matrix dithering. Fractal geometric patterns in the background — Sierpinski triangles, hexagonal tessellations, recursive diamond grids. Color palette: deep cathode-ray blue (#1a3a5c to #4a9eff), warm amber (#d4a017 to #ffcc44), salmon red (#e8735a), warm muted greens (#5a8a5c). Subjects built from clean geometric shapes — triangular facets, polygonal planes, like a low-poly render but flat and 2D with dithered color fills instead of smooth shading. Think: Saul Bass designed a character select screen for an Amiga game. Geometric line-art icons. Chunky retrofuturist typeface for headers, smaller geometric caps for subtitles. Horizontal scanline overlay. No photorealism, no soft shadows, no AI-gradient smoothness. Every color transition is a hard dither pattern. Clean, precise, geometric, but retro-cool. In the bottom-right corner, include very small, barely visible dithered text reading 'John Evans — Duval Software' in a muted tone that blends into the fractal background.",
         defaultAspectRatio: "4:5",
     },
     "clean-tech-infographic": {
         description: "Clean technical infographic for architecture diagrams, system flows, and data pipelines. Dark navy background, cyan/electric blue glowing connection lines, geometric nodes, professional and precise.",
-        promptPrefix: "Clean, professional technical infographic on a dark navy (#0a1628) background with subtle grid lines. Use cyan (#00d4ff) and electric blue (#4a9eff) glowing connection lines between components. White and light gray text only — no bright colors for text. Components rendered as clean geometric shapes: rounded rectangles, hexagons, circles with thin borders and subtle inner glow. Icons are minimal line-art style (server racks, phones, browsers, databases, cloud services). Typography: modern sans-serif (like Inter or SF Pro) — bold for titles, regular weight for labels, monospace for technical details (ports, protocols, versions). Layout follows clear left-to-right or top-to-bottom data flow with labeled arrows showing protocols and data formats. No decorative illustrations, no clip art, no logos, no random embellishments. Include a thin tech stack bar at the bottom. The overall feel is a polished engineering diagram you'd present to a CTO — precise, minimal, and authoritative.",
+        promptPrefix: "Clean, professional technical infographic on a dark navy (#0a1628) background with subtle grid lines. Use cyan (#00d4ff) and electric blue (#4a9eff) glowing connection lines between components. White and light gray text only — no bright colors for text. Components rendered as clean geometric shapes: rounded rectangles, hexagons, circles with thin borders and subtle inner glow. Icons are minimal line-art style (server racks, phones, browsers, databases, cloud services). Typography: modern sans-serif (like Inter or SF Pro) — bold for titles, regular weight for labels, monospace for technical details (ports, protocols, versions). Layout follows clear left-to-right or top-to-bottom data flow with labeled arrows showing protocols and data formats. No decorative illustrations, no clip art, no logos, no random embellishments. Include a thin tech stack bar at the bottom. The overall feel is a polished engineering diagram you'd present to a CTO — precise, minimal, and authoritative. In the bottom-right corner, include very small, barely visible text reading 'John Evans — Duval Software' in a dim navy tone that nearly disappears into the background.",
         defaultAspectRatio: "16:9",
     },
 };
@@ -2302,16 +2352,39 @@ server.tool("interactive_fix", `Opens an image in a browser-based crop tool wher
         };
     }
 });
-server.tool("remove_background", `Remove white (or near-white) background from an image and make it transparent. Outputs a PNG with alpha channel. The image must already exist in ${SAVE_DIR} (use save_image to import first).`, {
+function parseHexColor(hex) {
+    const h = hex.replace(/^#/, "");
+    if (h.length === 3) {
+        return [
+            parseInt(h[0] + h[0], 16),
+            parseInt(h[1] + h[1], 16),
+            parseInt(h[2] + h[2], 16),
+        ];
+    }
+    if (h.length === 6) {
+        return [
+            parseInt(h.slice(0, 2), 16),
+            parseInt(h.slice(2, 4), 16),
+            parseInt(h.slice(4, 6), 16),
+        ];
+    }
+    throw new Error(`Invalid hex color: ${hex}`);
+}
+server.tool("remove_background", `Remove a background color from an image and make it transparent. Outputs a PNG with alpha channel. The image must already exist in ${SAVE_DIR} (use save_image to import first).`, {
     filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    color: z
+        .string()
+        .default("#FFFFFF")
+        .describe('Target background color as hex (e.g. "#FFFFFF" for white, "#000000" for black, "#FF0000" for red). Default: white.'),
     threshold: z
         .number()
         .min(0)
         .max(255)
         .default(30)
-        .describe("How far from pure white a pixel can be and still count as background (0 = exact white only, 30 = default, higher = more aggressive)"),
-}, async ({ filename, threshold }) => {
+        .describe("How far from the target color a pixel can be and still count as background (0 = exact match only, 30 = default, higher = more aggressive)"),
+}, async ({ filename, color, threshold }) => {
     try {
+        const [targetR, targetG, targetB] = parseHexColor(color);
         const srcPath = join(SAVE_DIR, filename);
         const { data, info } = await sharp(srcPath)
             .ensureAlpha()
@@ -2322,8 +2395,10 @@ server.tool("remove_background", `Remove white (or near-white) background from a
             const r = data[i];
             const g = data[i + 1];
             const b = data[i + 2];
-            if (r >= 255 - threshold && g >= 255 - threshold && b >= 255 - threshold) {
-                data[i + 3] = 0; // set alpha to 0
+            if (Math.abs(r - targetR) <= threshold &&
+                Math.abs(g - targetG) <= threshold &&
+                Math.abs(b - targetB) <= threshold) {
+                data[i + 3] = 0;
             }
         }
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -2335,14 +2410,14 @@ server.tool("remove_background", `Remove white (or near-white) background from a
             .png()
             .toFile(outPath);
         const s = await stat(outPath);
-        log(`remove_background: ${filename} -> ${outFilename} (${(s.size / 1024).toFixed(0)}KB, threshold=${threshold})`);
+        log(`remove_background: ${filename} -> ${outFilename} (${(s.size / 1024).toFixed(0)}KB, color=${color}, threshold=${threshold})`);
         // Register in viewer
         await ensureViewer();
         const fullPng = await readFile(outPath);
         const id = randomUUID();
         const img = {
             id,
-            prompt: `remove_background(${filename}, threshold=${threshold})`,
+            prompt: `remove_background(${filename}, color=${color}, threshold=${threshold})`,
             fullPng,
             timestamp: Date.now(),
             filename: outFilename,
@@ -2363,6 +2438,74 @@ server.tool("remove_background", `Remove white (or near-white) background from a
         log(`remove_background error: ${msg}`);
         return {
             content: [{ type: "text", text: `remove_background failed: ${msg}` }],
+            isError: true,
+        };
+    }
+});
+function traceAsync(input, options) {
+    return new Promise((resolve, reject) => {
+        potrace.trace(input, options, (err, svg) => {
+            if (err)
+                reject(err);
+            else
+                resolve(svg);
+        });
+    });
+}
+server.tool("trace_to_svg", `Convert a raster image to SVG using potrace vectorization. Best for line art, diagrams, logos, and high-contrast images. The image must already exist in ${SAVE_DIR} (use save_image to import first).`, {
+    filename: z.string().describe(`Filename of the source image in ${SAVE_DIR}`),
+    threshold: z
+        .number()
+        .min(-1)
+        .max(255)
+        .default(-1)
+        .describe("Brightness threshold for black/white conversion (0-255). Lower = more black. -1 = auto-detect. Default: auto."),
+    invert: z
+        .boolean()
+        .default(false)
+        .describe("Invert the image before tracing (useful for light-on-dark images)"),
+    turdsize: z
+        .number()
+        .min(0)
+        .default(2)
+        .describe("Suppress speckles up to this size (in pixels). Default: 2."),
+}, async ({ filename, threshold, invert, turdsize }) => {
+    try {
+        const srcPath = join(SAVE_DIR, filename);
+        let inputBuf;
+        if (invert) {
+            inputBuf = await sharp(srcPath).negate({ alpha: false }).png().toBuffer();
+        }
+        else {
+            inputBuf = await readFile(srcPath);
+        }
+        const opts = {
+            turdSize: turdsize,
+            background: "transparent",
+        };
+        if (threshold >= 0)
+            opts.threshold = threshold;
+        const svg = await traceAsync(inputBuf, opts);
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const outFilename = `${ts}_traced.svg`;
+        const outPath = join(SAVE_DIR, outFilename);
+        await writeFile(outPath, svg);
+        const s = await stat(outPath);
+        log(`trace_to_svg: ${filename} -> ${outFilename} (${(s.size / 1024).toFixed(1)}KB)`);
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Traced to SVG! Saved as ${outFilename} (${(s.size / 1024).toFixed(1)}KB) in ${SAVE_DIR}`,
+                },
+            ],
+        };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`trace_to_svg error: ${msg}`);
+        return {
+            content: [{ type: "text", text: `trace_to_svg failed: ${msg}` }],
             isError: true,
         };
     }
