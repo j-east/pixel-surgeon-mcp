@@ -1,18 +1,39 @@
 {
   "name": "pixel-surgeon-mcp",
   "version": "1.0.0",
+  "mcpName": "io.github.j-east/pixel-surgeon",
   "main": "dist/index.js",
   "type": "module",
+  "bin": {
+    "pixel-surgeon-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "viewer": "node dist/index.js --viewer",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "prepublishOnly": "npm run build"
   },
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "image-generation",
+    "image-editing",
+    "gemini",
+    "openai",
+    "ai",
+    "video-generation"
+  ],
   "author": "John Evans",
   "license": "MIT",
-  "description": "MCP server for generating and editing images with Gemini and OpenAI",
+  "description": "MCP server for AI image & video generation, editing, and region repair. Powered by Gemini and OpenAI.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/j-east/pixel-surgeon-mcp.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "potrace": "^2.1.8",
