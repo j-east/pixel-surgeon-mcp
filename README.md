@@ -132,29 +132,32 @@ You need at least one provider API key. You can use any combination for maximum 
 
 > Grok Imagine is the fastest and cheapest provider. Great for rapid iteration and prototyping. Fixed output resolutions (~1K) with no size control.
 
-### Prerequisites
+### Quick start (npx)
 
-- Node.js 18+
-
-### Install
+No install needed — run directly with npx. Pass whichever API keys you have:
 
 ```bash
-git clone https://github.com/j-east/pixel-surgeon-mcp.git
-cd pixel-surgeon-mcp
-npm install
-npm run build
+npx pixel-surgeon-mcp
 ```
 
-### Configure your MCP client
+#### Claude Code CLI
 
-Add to your Claude Code or Claude Desktop config. Include whichever API keys you have:
+```bash
+claude mcp add pixel-surgeon \
+  -e GOOGLE_API_KEY=your-google-key \
+  -e OPENAI_API_KEY=your-openai-key \
+  -e XAI_API_KEY=your-xai-key \
+  -- npx pixel-surgeon-mcp
+```
+
+#### Claude Desktop / MCP client config
 
 ```json
 {
   "mcpServers": {
     "pixel-surgeon": {
-      "command": "node",
-      "args": ["/path/to/pixel-surgeon-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["pixel-surgeon-mcp"],
       "env": {
         "GOOGLE_API_KEY": "your-google-api-key",
         "OPENAI_API_KEY": "your-openai-api-key",
@@ -165,14 +168,15 @@ Add to your Claude Code or Claude Desktop config. Include whichever API keys you
 }
 ```
 
-Or via the Claude Code CLI:
+### Install from source
+
+If you prefer a local clone:
 
 ```bash
-claude mcp add pixel-surgeon \
-  -e GOOGLE_API_KEY=your-google-key \
-  -e OPENAI_API_KEY=your-openai-key \
-  -e XAI_API_KEY=your-xai-key \
-  -- node /path/to/pixel-surgeon-mcp/dist/index.js
+git clone https://github.com/j-east/pixel-surgeon-mcp.git
+cd pixel-surgeon-mcp
+npm install
+npm run build
 ```
 
 ### Image output
