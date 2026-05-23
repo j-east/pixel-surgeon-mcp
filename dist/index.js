@@ -39,15 +39,16 @@ function loadKeysFromClaudeConfig() {
         const configPath = join(homedir(), ".claude.json");
         const config = JSON.parse(readFileSync(configPath, "utf-8"));
         const env = config?.mcpServers?.["pixel-surgeon"]?.env ?? {};
-        return { google: env.GOOGLE_API_KEY ?? "", openai: env.OPENAI_API_KEY ?? "" };
+        return { google: env.GOOGLE_API_KEY ?? "", openai: env.OPENAI_API_KEY ?? "", xai: env.XAI_API_KEY ?? "" };
     }
     catch {
-        return { google: "", openai: "" };
+        return { google: "", openai: "", xai: "" };
     }
 }
-const _claudeKeys = (!process.env.GOOGLE_API_KEY && !process.env.OPENAI_API_KEY) ? loadKeysFromClaudeConfig() : { google: "", openai: "" };
+const _claudeKeys = (!process.env.GOOGLE_API_KEY && !process.env.OPENAI_API_KEY && !process.env.XAI_API_KEY) ? loadKeysFromClaudeConfig() : { google: "", openai: "", xai: "" };
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || _claudeKeys.google;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || _claudeKeys.openai;
+const XAI_API_KEY = process.env.XAI_API_KEY || _claudeKeys.xai;
 const MODELS = {
     "gemini-3.1-flash-image": {
         id: "gemini-3.1-flash-image-preview",
@@ -71,6 +72,12 @@ const MODELS = {
         id: "gpt-image-2",
         label: "GPT Image 2 (OpenAI)",
         provider: "openai",
+        tier: "paid",
+    },
+    "grok-imagine": {
+        id: "grok-imagine-image-quality",
+        label: "Grok Imagine (xAI)",
+        provider: "xai",
         tier: "paid",
     },
 };
@@ -99,7 +106,7 @@ function getProvider(modelKey) {
         throw new Error(`Unknown model "${key}". Available: ${MODEL_KEYS.join(", ")}`);
     const provider = providers[entry.provider];
     if (!provider) {
-        const envHint = entry.provider === "gemini" ? "GOOGLE_API_KEY" : "OPENAI_API_KEY";
+        const envHint = entry.provider === "gemini" ? "GOOGLE_API_KEY" : entry.provider === "xai" ? "XAI_API_KEY" : "OPENAI_API_KEY";
         throw new Error(`Provider "${entry.provider}" not available. Set ${envHint} env var.`);
     }
     return { provider, modelId: entry.id, modelKey: key };
@@ -1433,6 +1440,104 @@ class OpenAIProvider {
         return { imageBase64, text: "", modelUsed: req.modelId };
     }
 }
+const GROK_ASPECT_MAP = {
+    "1:1": "1:1", "16:9": "16:9", "9:16": "9:16",
+    "3:4": "3:4", "4:3": "4:3", "2:3": "2:3", "3:2": "3:2",
+    "4:5": "3:4", "5:4": "4:3",
+};
+function grokAspect(aspectRatio) {
+    return GROK_ASPECT_MAP[aspectRatio] ?? "1:1";
+}
+class GrokProvider {
+    name = "xai";
+    async generate(req) {
+        const aspect = grokAspect(req.aspectRatio);
+        const t0 = Date.now();
+        log(`  Calling xAI ${req.modelId} generate (aspect=${aspect})...`);
+        let res;
+        try {
+            res = await fetch("https://api.x.ai/v1/images/generations", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${XAI_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    model: req.modelId,
+                    prompt: req.prompt,
+                    n: 1,
+                    aspect_ratio: aspect,
+                    response_format: "b64_json",
+                }),
+            });
+        }
+        catch (fetchErr) {
+            throw new Error(`Network error calling xAI API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+        }
+        const elapsed = Date.now() - t0;
+        log(`  xAI responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+        const rawBody = await res.text();
+        let data;
+        try {
+            data = JSON.parse(rawBody);
+        }
+        catch {
+            throw new Error(`xAI API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+        }
+        if (!res.ok || data.error) {
+            throw new Error(`xAI API HTTP ${res.status}: ${data.error?.message ?? rawBody.slice(0, 2000)}`);
+        }
+        const imageBase64 = data.data?.[0]?.b64_json;
+        if (!imageBase64) {
+            throw new Error(`xAI returned no image data. Response: ${rawBody.slice(0, 2000)}`);
+        }
+        log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${req.modelId}`);
+        return { imageBase64, text: "", modelUsed: req.modelId };
+    }
+    async edit(req) {
+        const t0 = Date.now();
+        log(`  Calling xAI ${req.modelId} edit...`);
+        let res;
+        try {
+            res = await fetch("https://api.x.ai/v1/images/edits", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${XAI_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    model: req.modelId,
+                    prompt: req.prompt,
+                    image: { url: `data:${req.imageMime};base64,${req.imageBase64}`, type: "image_url" },
+                    n: 1,
+                    response_format: "b64_json",
+                }),
+            });
+        }
+        catch (fetchErr) {
+            throw new Error(`Network error calling xAI edit API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+        }
+        const elapsed = Date.now() - t0;
+        log(`  xAI edit responded HTTP ${res.status} in ${(elapsed / 1000).toFixed(1)}s`);
+        const rawBody = await res.text();
+        let data;
+        try {
+            data = JSON.parse(rawBody);
+        }
+        catch {
+            throw new Error(`xAI edit API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+        }
+        if (!res.ok || data.error) {
+            throw new Error(`xAI edit API HTTP ${res.status}: ${data.error?.message ?? rawBody.slice(0, 2000)}`);
+        }
+        const imageBase64 = data.data?.[0]?.b64_json;
+        if (!imageBase64) {
+            throw new Error(`xAI edit returned no image data. Response: ${rawBody.slice(0, 2000)}`);
+        }
+        log(`  Got image: ${(imageBase64.length / 1024).toFixed(0)}KB base64 from ${req.modelId} edit`);
+        return { imageBase64, text: "", modelUsed: req.modelId };
+    }
+}
 // --- Veo API ---
 async function callVeo(prompt, aspectRatio, durationSeconds) {
     const t0 = Date.now();
@@ -1555,7 +1660,8 @@ const EXPLICIT_FREE_NOTICE = `\u2139\uFE0F Generated with ${MODEL_FALLBACK} (Gem
     `For higher-quality image generation, pass model='${GEMINI_DEFAULT}' — this requires prepaid credits on your Google AI account.`;
 const MODEL_PARAM_DESCRIPTION = `Model to use. Available: ${MODEL_KEYS.map(k => `'${k}' (${MODELS[k].label})`).join(", ")}. ` +
     `Default: '${getDefaultModelKey()}'. Set DEFAULT_IMAGE_MODEL env var to change the default. ` +
-    `Gemini models fall back to free tier on billing errors. OpenAI requires OPENAI_API_KEY.`;
+    `Provider tradeoffs: grok-imagine is fastest and cheapest; gemini is mid-quality with the best price/performance ratio (free tier available); gpt-image-2 is highest quality but slower and more expensive. ` +
+    `Gemini models fall back to free tier on billing errors. OpenAI requires OPENAI_API_KEY. Grok requires XAI_API_KEY.`;
 function noticeFor(modelUsed, explicitModelKey) {
     if (explicitModelKey && MODELS[explicitModelKey]?.provider !== "gemini")
         return "";
@@ -2529,17 +2635,21 @@ async function main() {
         providers["openai"] = new OpenAIProvider();
         log("OpenAI provider available");
     }
+    if (XAI_API_KEY) {
+        providers["xai"] = new GrokProvider();
+        log("xAI/Grok provider available");
+    }
     if (process.argv.includes("--viewer")) {
-        if (!GOOGLE_API_KEY && !OPENAI_API_KEY) {
-            console.log("Note: No API keys set — viewer is read-only (respin disabled). Set GOOGLE_API_KEY or OPENAI_API_KEY to enable generation.");
+        if (!GOOGLE_API_KEY && !OPENAI_API_KEY && !XAI_API_KEY) {
+            console.log("Note: No API keys set — viewer is read-only (respin disabled). Set GOOGLE_API_KEY, OPENAI_API_KEY, or XAI_API_KEY to enable generation.");
         }
         viewerPort = await startViewer();
         console.log(`pixel-surgeon-mcp viewer running at http://localhost:${viewerPort}`);
         openExternal(`http://localhost:${viewerPort}`);
         return;
     }
-    if (!GOOGLE_API_KEY && !OPENAI_API_KEY) {
-        log("WARNING: Neither GOOGLE_API_KEY nor OPENAI_API_KEY is set. No image providers available.");
+    if (!GOOGLE_API_KEY && !OPENAI_API_KEY && !XAI_API_KEY) {
+        log("WARNING: No API keys set (GOOGLE_API_KEY, OPENAI_API_KEY, XAI_API_KEY). No image providers available.");
     }
     log(`Default model: ${getDefaultModelKey()}`);
     const transport = new StdioServerTransport();
