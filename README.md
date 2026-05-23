@@ -6,13 +6,14 @@
 
 <p align="center">
   <strong>MCP server for AI image &amp; video generation, editing, and transplant-grade region repair</strong><br/>
-  Powered by Gemini 3.1 Flash Image, OpenAI GPT Image 2, and Veo 3
+  Powered by Gemini 3.1 Flash Image, OpenAI GPT Image 2, Grok Imagine, and Veo 3
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-stdio-blue" alt="MCP stdio" />
   <img src="https://img.shields.io/badge/Gemini_3.1-Flash_Image-4285F4?logo=google" alt="Gemini" />
   <img src="https://img.shields.io/badge/GPT_Image_2-OpenAI-412991?logo=openai&logoColor=white" alt="OpenAI" />
+  <img src="https://img.shields.io/badge/Grok_Imagine-xAI-000000?logo=x&logoColor=white" alt="Grok" />
   <img src="https://img.shields.io/badge/Veo_3-Video-34A853?logo=google" alt="Veo 3" />
   <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
 </p>
@@ -23,15 +24,19 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude (or any MCP c
 
 ## How it works
 
-pixel-surgeon-mcp is a **multi-provider** image generation server. You can use either or both providers, and switch between them per-request:
+pixel-surgeon-mcp is a **multi-provider** image generation server. You can use any combination of providers and switch between them per-request:
 
-### Gemini (Google)
+### Gemini (Google) — balanced
 
-Google's image generation pipeline uses a two-stage approach: **Gemini 3.1 Pro** reasons about your prompt, then **Gemini 3.1 Flash Image** renders the pixels. Supports 9 aspect ratios at 512/1K/2K/4K resolution.
+Google's image generation pipeline uses a two-stage approach: **Gemini 3.1 Pro** reasons about your prompt, then **Gemini 3.1 Flash Image** renders the pixels. Supports 9 aspect ratios at 512/1K/2K/4K resolution. Best price/performance ratio, with a free tier available.
 
-### OpenAI GPT Image 2
+### OpenAI GPT Image 2 — highest quality
 
-OpenAI's latest image model with dramatically improved text rendering and visual fidelity. Supports flexible resolutions — pixel-surgeon maps your chosen size and aspect ratio to the optimal pixel dimensions automatically. Quality levels: `medium` (fast) and `high` (print-ready). **Excellent for infographics, diagrams, and text-heavy images** where Gemini models struggle.
+OpenAI's latest image model with dramatically improved text rendering and visual fidelity. Supports flexible resolutions — pixel-surgeon maps your chosen size and aspect ratio to the optimal pixel dimensions automatically. Quality levels: `medium` (fast) and `high` (print-ready). **Excellent for infographics, diagrams, and text-heavy images** where other models struggle. Slower and more expensive.
+
+### Grok Imagine (xAI) — fastest
+
+xAI's Aurora-powered image model. Fastest generation speed and lowest cost. Supports 7 aspect ratios at fixed resolutions (~1K). Good for rapid prototyping and iteration.
 
 ### Veo 3 (Video)
 
@@ -64,6 +69,7 @@ AI image models struggle with text-heavy images. The fix tools solve this by sen
 | `gemini-2.5-flash-image` | Google | 1K max (free tier) | Quick drafts, prototyping |
 | `gpt-image-2` | OpenAI | Flexible (up to 4K) | Text-heavy images, infographics, diagrams, typography |
 | `gpt-image-1` | OpenAI | 3 fixed sizes | Legacy support |
+| `grok-imagine` | xAI | Fixed (~1K per ratio) | Fast iteration, lowest cost |
 
 Force a specific model per-call via the `model` tool parameter, or set `DEFAULT_IMAGE_MODEL` env var.
 
@@ -80,10 +86,10 @@ Magazine editorial, bold typography, halftone textures. Cream, black, and terrac
 
 <img src="assets/style-neo-brutalist.png" alt="neo-brutalist style example" width="400" />
 
-### `neo-retro-futurism`
-1960s Space Age meets 1980s arcade. Cathode blue, amber, and salmon palette.
+### `duval-software-infographic`
+Duval Software's signature retro-futurist infographic style. 1960s Space Age meets 1980s arcade. Cathode blue, amber, and salmon palette. Great for diagrams and system overviews.
 
-<img src="assets/style-neo-retro-futurism.png" alt="neo-retro-futurism style example" width="400" />
+<img src="assets/style-neo-retro-futurism.png" alt="duval-software-infographic style example" width="400" />
 
 ### `fractal-arcade`
 Dithered fractals, Sierpinski patterns, low-poly. CRT retro, Amiga/EGA palette.
@@ -99,7 +105,7 @@ Technical diagrams, system flows, data pipelines. Dark navy, cyan, and electric 
 
 ### Get your API key(s)
 
-You need at least one provider API key. You can use both for maximum flexibility.
+You need at least one provider API key. You can use any combination for maximum flexibility.
 
 #### Google (Gemini + Veo 3)
 
@@ -117,6 +123,14 @@ You need at least one provider API key. You can use both for maximum flexibility
 4. Ensure you have API credits — image generation is billed per request
 
 > GPT Image 2 excels at text rendering, infographics, and diagrams. If you primarily need text-heavy images, this is the provider to use.
+
+#### xAI (Grok Imagine)
+
+1. Go to [xAI Console](https://console.x.ai/)
+2. Sign in or create an account
+3. Create an API key and copy it
+
+> Grok Imagine is the fastest and cheapest provider. Great for rapid iteration and prototyping. Fixed output resolutions (~1K) with no size control.
 
 ### Prerequisites
 
@@ -143,7 +157,8 @@ Add to your Claude Code or Claude Desktop config. Include whichever API keys you
       "args": ["/path/to/pixel-surgeon-mcp/dist/index.js"],
       "env": {
         "GOOGLE_API_KEY": "your-google-api-key",
-        "OPENAI_API_KEY": "your-openai-api-key"
+        "OPENAI_API_KEY": "your-openai-api-key",
+        "XAI_API_KEY": "your-xai-api-key"
       }
     }
   }
@@ -156,6 +171,7 @@ Or via the Claude Code CLI:
 claude mcp add pixel-surgeon \
   -e GOOGLE_API_KEY=your-google-key \
   -e OPENAI_API_KEY=your-openai-key \
+  -e XAI_API_KEY=your-xai-key \
   -- node /path/to/pixel-surgeon-mcp/dist/index.js
 ```
 
@@ -192,7 +208,7 @@ Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should incl
 
 ### Model adapters
 
-The server currently supports Gemini, OpenAI, and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
+The server currently supports Gemini, OpenAI, Grok Imagine, and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
 
 ## Built by Duval Software
 
