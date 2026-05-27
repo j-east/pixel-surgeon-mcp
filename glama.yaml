@@ -1,0 +1,40 @@
+name: pixel-surgeon-mcp
+description: AI image and video generation, editing, and region repair via Gemini, OpenAI, and Grok
+version: 1.1.1
+tags:
+  - image-generation
+  - image-editing
+  - video-generation
+  - gemini
+  - openai
+  - grok
+  - ai
+
+spec:
+  docker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+  runtime:
+    command: ["mcp-proxy", "node", "dist/index.js"]
+    workingDir: /app
+    user: mcp
+  protocol: stdio
+  capabilities:
+    - tools
+  resources:
+    memory: 512Mi
+    cpu: "0.5"
+  env:
+    - name: GOOGLE_API_KEY
+      description: Google AI API key (enables Gemini image/video generation)
+      required: false
+      secret: true
+    - name: OPENAI_API_KEY
+      description: OpenAI API key (enables GPT Image 1/2 generation)
+      required: false
+      secret: true
+    - name: XAI_API_KEY
+      description: xAI API key (enables Grok Imagine generation)
+      required: false
+      secret: true
