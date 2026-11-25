@@ -364,7 +364,7 @@ const pendingSelections = new Map();
 const pendingCrops = new Map();
 function notifyViewerClients(img) {
     void writeSidecar(img);
-    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed, imageSize: img.imageSize, aspectRatio: img.aspectRatio, name: img.name ?? null });
+    const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed, imageSize: img.imageSize, aspectRatio: img.aspectRatio, name: img.name ?? img.filename });
     for (const client of sseClients) {
         client.write(`data: ${event}\n\n`);
     }
@@ -653,7 +653,7 @@ function viewerHtml() {
         const aspectOpts = RESPIN_ASPECTS.map(a => `<option value="${a}"${a === curAspect ? " selected" : ""}>${a}</option>`).join("");
         const modelOpts = MODEL_KEYS.map(k => `<option value="${k}"${MODELS[k].id === curModel ? " selected" : ""}>${esc(MODELS[k].label)}</option>`).join("");
         return `<div class="img-entry" id="img-${img.id}">
-          ${img.name ? `<div class="image-name">${esc(img.name)}</div>` : ""}
+          <div class="image-name">${esc(img.name ?? img.filename)}</div>
           <div class="prompt-row">
             <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
             <div class="respin-controls">
@@ -991,10 +991,10 @@ function renderHistoryItems(items) {
     const curAspect = it.aspectRatio || "1:1";
     const meta = [fmtTs(it.timestamp), curSize, curAspect, it.modelUsed || "?"].filter(Boolean).join(" · ");
 
-    if (it.name) {
+    if (it.name || it.filename) {
       const nameEl = document.createElement("div");
       nameEl.className = "image-name";
-      nameEl.textContent = it.name;
+      nameEl.textContent = it.name || it.filename;
       div.appendChild(nameEl);
     }
     const row = document.createElement("div");
@@ -1977,7 +1977,7 @@ async function generateAndStore(prompt, aspectRatio, imageSize, modelKey, name) 
     return { mcpBase64, mcpMimeType, text, filename, modelUsed };
 }
 /** Edit, store, return shrunk for MCP */
-async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, imageSize, modelKey) {
+async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, imageSize, modelKey, name) {
     const { provider, modelId } = getProvider(modelKey);
     const { imageBase64, text, modelUsed } = await provider.edit({
         prompt,
@@ -1989,9 +1989,10 @@ async function editAndStore(prompt, sourceBase64, sourceMime, aspectRatio, image
     });
     const fullPng = Buffer.from(imageBase64, "base64");
     const id = randomUUID();
-    const filename = await saveToDisk(fullPng, id.slice(0, 8));
-    log(`  Saved ${filename}`);
-    const img = { id, prompt: `[edit] ${prompt}`, fullPng, timestamp: Date.now(), filename, modelUsed };
+    const label = name ? name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) : id.slice(0, 8);
+    const filename = await saveToDisk(fullPng, label);
+    log(`  Saved ${filename}${name ? ` (name: ${name})` : ""}`);
+    const img = { id, prompt: `[edit] ${prompt}`, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize, modelUsed, name: name || undefined };
     imageStore.push(img);
     notifyViewerClients(img);
     const { base64: mcpBase64, mime: mcpMimeType } = await shrinkForMcp(fullPng);
@@ -2411,7 +2412,8 @@ server.tool("edit_image", `Edit an existing image. Supports Gemini and OpenAI mo
         .optional()
         .describe(STYLE_DESCRIPTION),
     model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
-}, async ({ prompt, filename, aspect_ratio, image_size, style, model }) => {
+    name: z.string().optional().describe("Short human-readable name for the edited image (e.g. 'logo-v2-blue'). Used in the filename and shown above the image in the viewer."),
+}, async ({ prompt, filename, aspect_ratio, image_size, style, model, name }) => {
     try {
         await ensureViewer();
         const styledPrompt = applyStyle(prompt, style);
@@ -2420,7 +2422,7 @@ server.tool("edit_image", `Edit an existing image. Supports Gemini and OpenAI mo
         const t0 = Date.now();
         const { base64: srcBase64, mime: srcMime } = await loadForGemini(filename);
         const resolvedSize = resolveImageSize(image_size, model);
-        const { mcpBase64, mcpMimeType, text, filename: outFilename, modelUsed } = await editAndStore(styledPrompt, srcBase64, srcMime, resolvedAR, resolvedSize, model);
+        const { mcpBase64, mcpMimeType, text, filename: outFilename, modelUsed } = await editAndStore(styledPrompt, srcBase64, srcMime, resolvedAR, resolvedSize, model, name);
         log(`edit_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return {
             content: [
