@@ -6,7 +6,7 @@ import sharp from "sharp";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { randomUUID } from "crypto";
 import { writeFile, readFile, mkdir, readdir, copyFile, stat } from "fs/promises";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename, extname } from "path";
 import { homedir } from "os";
 import { createRequire } from "module";
@@ -33,21 +33,27 @@ function openExternal(target: string): void {
   });
 }
 
-function loadKeysFromClaudeConfig(): { google: string; openai: string; xai: string } {
+function loadKeysFromClaudeConfig(): { google: string; openai: string; xai: string; openrouter: string } {
   try {
     const configPath = join(homedir(), ".claude.json");
     const config = JSON.parse(readFileSync(configPath, "utf-8"));
     const env = config?.mcpServers?.["pixel-surgeon"]?.env ?? {};
-    return { google: env.GOOGLE_API_KEY ?? "", openai: env.OPENAI_API_KEY ?? "", xai: env.XAI_API_KEY ?? "" };
+    return {
+      google: env.GOOGLE_API_KEY ?? "",
+      openai: env.OPENAI_API_KEY ?? "",
+      xai: env.XAI_API_KEY ?? "",
+      openrouter: env.OPENROUTER_API_KEY ?? "",
+    };
   } catch {
-    return { google: "", openai: "", xai: "" };
+    return { google: "", openai: "", xai: "", openrouter: "" };
   }
 }
 
-const _claudeKeys = (!process.env.GOOGLE_API_KEY && !process.env.OPENAI_API_KEY && !process.env.XAI_API_KEY) ? loadKeysFromClaudeConfig() : { google: "", openai: "", xai: "" };
+const _claudeKeys = (!process.env.GOOGLE_API_KEY && !process.env.OPENAI_API_KEY && !process.env.XAI_API_KEY && !process.env.OPENROUTER_API_KEY) ? loadKeysFromClaudeConfig() : { google: "", openai: "", xai: "", openrouter: "" };
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || _claudeKeys.google;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || _claudeKeys.openai;
 const XAI_API_KEY = process.env.XAI_API_KEY || _claudeKeys.xai;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || _claudeKeys.openrouter;
 
 // --- Provider abstraction ---
 
@@ -83,21 +89,38 @@ interface ImageProvider {
 
 type ProviderName = "gemini" | "openai" | "xai";
 
+/**
+ * Presets: short names for models we have tuned sizes and notes for. They are a convenience,
+ * not a whitelist. Any raw provider model id is also accepted (see resolveModel), so a model a
+ * provider ships tomorrow works without a code change. list_models shows what the keys can use.
+ */
 const MODELS: Record<string, {
   id: string;
   label: string;
   provider: ProviderName;
   tier: string;
 }> = {
+  "nano-banana-2.1": {
+    id: "gemini-nano-banana-2.1",
+    label: "Nano Banana 2.1 (Gemini)",
+    provider: "gemini",
+    tier: "paid",
+  },
+  "nano-banana-pro": {
+    id: "gemini-3-pro-image",
+    label: "Nano Banana Pro (Gemini 3 Pro Image)",
+    provider: "gemini",
+    tier: "paid",
+  },
   "gemini-3.1-flash-image": {
-    id: "gemini-3.1-flash-image-preview",
-    label: "Gemini 3.1 Flash Image",
+    id: "gemini-3.1-flash-image",
+    label: "Nano Banana 2 (Gemini 3.1 Flash Image)",
     provider: "gemini",
     tier: "paid",
   },
   "gemini-2.5-flash-image": {
     id: "gemini-2.5-flash-image",
-    label: "Gemini 2.5 Flash Image",
+    label: "Nano Banana (Gemini 2.5 Flash Image)",
     provider: "gemini",
     tier: "free",
   },
@@ -121,39 +144,184 @@ const MODELS: Record<string, {
   },
 };
 
-type ModelKey = string & keyof typeof MODELS;
+type ModelKey = string;
 const MODEL_KEYS = Object.keys(MODELS) as [string, ...string[]];
 
-const GEMINI_DEFAULT: ModelKey = "gemini-3.1-flash-image";
+const GEMINI_DEFAULT: ModelKey = "nano-banana-2.1";
 const GEMINI_FALLBACK: ModelKey = "gemini-2.5-flash-image";
 
 const MODEL_PRIMARY = MODELS[GEMINI_DEFAULT].id;
 const MODEL_FALLBACK = MODELS[GEMINI_FALLBACK].id;
 
-function isGeminiModel(modelId: string): boolean {
-  const entry = Object.values(MODELS).find(m => m.id === modelId);
-  return entry?.provider === "gemini";
+const PROVIDER_PREFIXES: Record<string, ProviderName> = {
+  google: "gemini", gemini: "gemini", openai: "openai", xai: "xai", "x-ai": "xai",
+};
+
+/** Guess the provider of a raw model id from its name. */
+function inferProvider(id: string): ProviderName | undefined {
+  if (/^(gemini|nano-banana)/i.test(id)) return "gemini";
+  if (/^(gpt-image|chatgpt-image)/i.test(id)) return "openai";
+  if (/^grok/i.test(id)) return "xai";
+  return undefined;
+}
+
+/**
+ * Turn what the caller passed into a provider and the id that provider expects.
+ * Accepts a preset key, a raw provider model id ("gemini-nano-banana-2.1", "gpt-image-2.6-flare"),
+ * or "provider/id" ("google/...", "openai/...", "xai/...") for ids the name alone does not place.
+ * Returns undefined when it cannot tell which provider the model belongs to.
+ */
+function lookupModel(input: string): { key: string; id: string; provider: ProviderName; label: string } | undefined {
+  const key = input.trim();
+  if (!key) return undefined;
+  const preset = MODELS[key];
+  if (preset) return { key, id: preset.id, provider: preset.provider, label: preset.label };
+
+  let id = key;
+  let provider: ProviderName | undefined;
+  const prefixed = key.match(/^([a-z-]+)\/(.+)$/i);
+  if (prefixed && PROVIDER_PREFIXES[prefixed[1].toLowerCase()]) {
+    provider = PROVIDER_PREFIXES[prefixed[1].toLowerCase()];
+    id = prefixed[2];
+  }
+  id = id.replace(/^models\//, ""); // Google lists its models as "models/<id>"
+  provider ??= inferProvider(id);
+  if (!provider) return undefined;
+  return { key, id, provider, label: id };
+}
+
+function resolveModel(input?: string): { key: string; id: string; provider: ProviderName; label: string } {
+  const key = input?.trim() || getDefaultModelKey();
+  const found = lookupModel(key);
+  if (!found) {
+    throw new Error(
+      `Unknown model "${key}". Pass a preset (${MODEL_KEYS.join(", ")}), a raw provider model id ` +
+      `(gemini-* or nano-banana-*, gpt-image-*, grok-*), or "google/<id>", "openai/<id>", "xai/<id>". ` +
+      `Call list_models to see what your API keys can use right now.`
+    );
+  }
+  return found;
 }
 
 function getDefaultModelKey(): ModelKey {
-  const envModel = process.env.DEFAULT_IMAGE_MODEL;
-  if (envModel && envModel in MODELS) return envModel as ModelKey;
-  if (process.env.OPENAI_API_KEY) return "gpt-image-2";
+  const envModel = process.env.DEFAULT_IMAGE_MODEL?.trim();
+  if (envModel && lookupModel(envModel)) return envModel;
+  if (OPENAI_API_KEY) return "gpt-image-2";
   return GEMINI_DEFAULT;
 }
 
 const providers: Record<string, ImageProvider> = {};
 
 function getProvider(modelKey?: ModelKey): { provider: ImageProvider; modelId: string; modelKey: ModelKey } {
-  const key = modelKey ?? getDefaultModelKey();
-  const entry = MODELS[key];
-  if (!entry) throw new Error(`Unknown model "${key}". Available: ${MODEL_KEYS.join(", ")}`);
-  const provider = providers[entry.provider];
+  const model = resolveModel(modelKey);
+  const provider = providers[model.provider];
   if (!provider) {
-    const envHint = entry.provider === "gemini" ? "GOOGLE_API_KEY" : entry.provider === "xai" ? "XAI_API_KEY" : "OPENAI_API_KEY";
-    throw new Error(`Provider "${entry.provider}" not available. Set ${envHint} env var.`);
+    const envHint = model.provider === "gemini" ? "GOOGLE_API_KEY" : model.provider === "xai" ? "XAI_API_KEY" : "OPENAI_API_KEY";
+    throw new Error(`Provider "${model.provider}" not available. Set ${envHint} env var.`);
   }
-  return { provider, modelId: entry.id, modelKey: key };
+  return { provider, modelId: model.id, modelKey: model.key };
+}
+
+// --- Live model discovery ---
+// Each provider is asked which image models the configured key can use. list_models returns that
+// live. The result is also kept on disk so the next server start can name those models in the
+// `model` parameter description; each start refreshes the file in the background.
+
+interface DiscoveredModel { id: string; label?: string; created?: string }
+interface ModelCatalog {
+  fetchedAt: string;
+  providers: Partial<Record<ProviderName, DiscoveredModel[]>>;
+  errors: Partial<Record<ProviderName, string>>;
+}
+
+const MODEL_CACHE_FILE = join(homedir(), ".cache", "pixel-surgeon-mcp", "models.json");
+const DISCOVERY_TIMEOUT_MS = 8_000;
+
+function readModelCache(): ModelCatalog | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(MODEL_CACHE_FILE, "utf-8"));
+    if (parsed && typeof parsed.fetchedAt === "string" && parsed.providers) return parsed as ModelCatalog;
+  } catch { /* no cache yet */ }
+  return undefined;
+}
+
+async function fetchJson(url: string, headers: Record<string, string>): Promise<any> {
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
+  const body = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+  return JSON.parse(body);
+}
+
+const isoDate = (unixSeconds: unknown) =>
+  typeof unixSeconds === "number" ? new Date(unixSeconds * 1000).toISOString().slice(0, 10) : undefined;
+const newestFirst = (a: DiscoveredModel, b: DiscoveredModel) => (b.created ?? "").localeCompare(a.created ?? "");
+
+async function discoverGemini(): Promise<DiscoveredModel[]> {
+  const data = await fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { "x-goog-api-key": GOOGLE_API_KEY });
+  return (data.models ?? [])
+    .filter((m: any) => /image|banana/i.test(m.name ?? "") && (m.supportedGenerationMethods ?? []).includes("generateContent"))
+    .map((m: any) => ({ id: String(m.name).replace(/^models\//, ""), label: m.displayName }));
+}
+
+async function discoverOpenAI(): Promise<DiscoveredModel[]> {
+  const data = await fetchJson("https://api.openai.com/v1/models", { Authorization: `Bearer ${OPENAI_API_KEY}` });
+  return (data.data ?? [])
+    .filter((m: any) => /^(gpt-image|chatgpt-image)/i.test(m.id ?? ""))
+    .map((m: any) => ({ id: m.id, created: isoDate(m.created) }))
+    .sort(newestFirst);
+}
+
+async function discoverXai(): Promise<DiscoveredModel[]> {
+  const data = await fetchJson("https://api.x.ai/v1/image-generation-models", { Authorization: `Bearer ${XAI_API_KEY}` });
+  return (data.models ?? [])
+    .map((m: any) => ({ id: m.id, created: isoDate(m.created) }))
+    .sort(newestFirst);
+}
+
+/** Ask every configured provider for its image models and save the answer for the next start. */
+async function discoverModels(): Promise<ModelCatalog> {
+  const jobs: Array<[ProviderName, () => Promise<DiscoveredModel[]>]> = [];
+  if (GOOGLE_API_KEY) jobs.push(["gemini", discoverGemini]);
+  if (OPENAI_API_KEY) jobs.push(["openai", discoverOpenAI]);
+  if (XAI_API_KEY) jobs.push(["xai", discoverXai]);
+
+  const catalog: ModelCatalog = { fetchedAt: new Date().toISOString(), providers: {}, errors: {} };
+  const previous = readModelCache();
+  const results = await Promise.allSettled(jobs.map(([, job]) => job()));
+  results.forEach((result, i) => {
+    const name = jobs[i][0];
+    if (result.status === "fulfilled") {
+      catalog.providers[name] = result.value;
+    } else {
+      catalog.errors[name] = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      // Keep the last good list for a provider that failed this time.
+      if (previous?.providers[name]) catalog.providers[name] = previous.providers[name];
+    }
+  });
+
+  try {
+    mkdirSync(join(homedir(), ".cache", "pixel-surgeon-mcp"), { recursive: true });
+    writeFileSync(MODEL_CACHE_FILE, JSON.stringify(catalog, null, 2));
+  } catch (err: unknown) {
+    log(`Could not write model cache: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return catalog;
+}
+
+/** What the last discovery found, read once at start for the `model` parameter description. */
+const STARTUP_CATALOG = readModelCache();
+
+function describeDiscovered(catalog: ModelCatalog | undefined): string {
+  if (!catalog) return "";
+  const dated = /-\d{4}-\d{2}-\d{2}$/; // dated snapshots of a model already listed
+  const parts = (Object.keys(catalog.providers) as ProviderName[])
+    .map((name) => {
+      const ids = (catalog.providers[name] ?? []).map((m) => m.id).filter((id) => !dated.test(id)).slice(0, 12);
+      return ids.length ? `${name}: ${ids.join(", ")}` : "";
+    })
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return `Raw ids your keys could use as of ${catalog.fetchedAt.slice(0, 10)}: ${parts.join("; ")}. `;
 }
 
 const geminiEndpoint = (model: string) =>
@@ -167,6 +335,100 @@ const VEO_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const VEO_ENDPOINT = `${VEO_BASE}/models/${VEO_MODEL}:predictLongRunning`;
 const VEO_POLL_INTERVAL = 10_000; // 10 seconds
 const VEO_MAX_POLLS = 60; // 10 minutes max
+
+// --- OpenRouter video models (https://openrouter.ai/api/v1/videos/models) ---
+
+const OPENROUTER_VIDEO_BASE = "https://openrouter.ai/api/v1/videos";
+const OPENROUTER_VIDEO_POLL_INTERVAL = 8_000;
+const OPENROUTER_VIDEO_MAX_POLLS = 90; // 12 minutes max
+
+const VIDEO_ASPECTS = ["16:9", "9:16", "1:1", "4:3", "3:4"] as const;
+const VIDEO_RESOLUTIONS = ["480p", "720p", "1080p"] as const;
+
+/** Curated subset of OpenRouter's video catalog. Any raw OpenRouter model id is also accepted. */
+const VIDEO_MODELS: Record<string, {
+  id: string;
+  label: string;
+  durations: number[];
+  aspects: string[];
+  resolutions: string[];
+  lastFrame: boolean;
+  audio: boolean;
+  note: string;
+}> = {
+  "veo-3.1-fast": {
+    id: "google/veo-3.1-fast", label: "Veo 3.1 Fast",
+    durations: [4, 6, 8], aspects: ["16:9", "9:16"], resolutions: ["720p", "1080p"],
+    lastFrame: true, audio: true, note: "default; good quality, ~$0.08-0.12/s",
+  },
+  "veo-3.1": {
+    id: "google/veo-3.1", label: "Veo 3.1",
+    durations: [4, 6, 8], aspects: ["16:9", "9:16"], resolutions: ["720p", "1080p"],
+    lastFrame: true, audio: true, note: "best quality, ~$0.20-0.40/s",
+  },
+  "veo-3.1-lite": {
+    id: "google/veo-3.1-lite", label: "Veo 3.1 Lite",
+    durations: [4, 6, 8], aspects: ["16:9", "9:16"], resolutions: ["720p", "1080p"],
+    lastFrame: true, audio: true, note: "cheapest Veo, ~$0.03-0.08/s",
+  },
+  "kling-v3.0-std": {
+    id: "kwaivgi/kling-v3.0-std", label: "Kling 3.0 Standard",
+    durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1"], resolutions: ["720p"],
+    lastFrame: true, audio: true, note: "strong motion, ~$0.08/s",
+  },
+  "kling-v3.0-pro": {
+    id: "kwaivgi/kling-v3.0-pro", label: "Kling 3.0 Pro",
+    durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1"], resolutions: ["720p"],
+    lastFrame: true, audio: true, note: "~$0.11/s",
+  },
+  "seedance-2.0": {
+    id: "bytedance/seedance-2.0", label: "Seedance 2.0",
+    durations: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1", "4:3", "3:4"], resolutions: ["480p", "720p", "1080p"],
+    lastFrame: true, audio: true, note: "token-priced, up to 4K",
+  },
+  "seedance-2.0-fast": {
+    id: "bytedance/seedance-2.0-fast", label: "Seedance 2.0 Fast",
+    durations: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1", "4:3", "3:4"], resolutions: ["480p", "720p"],
+    lastFrame: true, audio: true, note: "cheap and quick",
+  },
+  "wan-2.7": {
+    id: "alibaba/wan-2.7", label: "Wan 2.7",
+    durations: [2, 3, 4, 5, 6, 7, 8, 9, 10], aspects: ["16:9", "9:16", "1:1", "4:3", "3:4"], resolutions: ["720p", "1080p"],
+    lastFrame: true, audio: true, note: "~$0.10/s",
+  },
+  "hailuo-3": {
+    id: "minimax/hailuo-3", label: "MiniMax Hailuo 3",
+    durations: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1", "4:3", "3:4"], resolutions: ["720p"],
+    lastFrame: true, audio: true, note: "~$0.13/s",
+  },
+  "grok-imagine-video": {
+    id: "x-ai/grok-imagine-video", label: "Grok Imagine Video",
+    durations: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], aspects: ["16:9", "9:16", "1:1", "4:3", "3:4"], resolutions: ["480p", "720p"],
+    lastFrame: false, audio: false, note: "cheapest, ~$0.05-0.07/s",
+  },
+  "runway-gen-4.5": {
+    id: "runway/gen-4.5", label: "Runway Gen-4.5",
+    durations: [2, 3, 4, 5, 6, 7, 8, 9, 10], aspects: ["16:9", "9:16"], resolutions: ["720p"],
+    lastFrame: false, audio: false, note: "~$0.12/s, no audio",
+  },
+};
+const VIDEO_MODEL_KEYS = Object.keys(VIDEO_MODELS);
+const DEFAULT_VIDEO_MODEL = process.env.DEFAULT_VIDEO_MODEL || "veo-3.1-fast";
+
+const VIDEO_MODEL_PARAM_DESCRIPTION =
+  `Video model (OpenRouter). Keys: ${VIDEO_MODEL_KEYS.map((k) => `${k} (${VIDEO_MODELS[k].note})`).join("; ")}. ` +
+  `Any raw OpenRouter video model id (e.g. "alibaba/wan-3.0") is also accepted. Default: ${DEFAULT_VIDEO_MODEL}.`;
+
+/** Snap a requested value to the nearest one the model supports; returns the value unchanged if the model is unknown or already supports it. */
+function snapToSupported<T extends string | number>(value: T, supported: T[] | undefined, what: string): T {
+  if (!supported || supported.length === 0 || supported.includes(value)) return value;
+  let pick = supported[0];
+  if (typeof value === "number") {
+    pick = (supported as number[]).reduce((best, d) => (Math.abs(d - value) < Math.abs(best - value) ? d : best), supported[0] as number) as T;
+  }
+  log(`  ${what} ${value} not supported by model, using ${pick}`);
+  return pick;
+}
 
 const MAX_MCP_BYTES = 950_000;
 
@@ -185,6 +447,7 @@ interface StoredImage {
   aspectRatio?: string;
   imageSize?: string;
   modelUsed?: string;
+  name?: string;
 }
 
 const imageStore: StoredImage[] = [];
@@ -196,6 +459,7 @@ interface StoredVideo {
   timestamp: number;
   aspectRatio: string;
   durationSeconds: number;
+  modelUsed?: string;
 }
 
 const videoStore: StoredVideo[] = [];
@@ -235,7 +499,7 @@ const pendingCrops = new Map<string, {
 
 function notifyViewerClients(img: StoredImage) {
   void writeSidecar(img);
-  const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed, imageSize: img.imageSize, aspectRatio: img.aspectRatio });
+  const event = JSON.stringify({ id: img.id, prompt: img.prompt, type: "image", modelUsed: img.modelUsed, imageSize: img.imageSize, aspectRatio: img.aspectRatio, name: img.name ?? null });
   for (const client of sseClients) {
     client.write(`data: ${event}\n\n`);
   }
@@ -250,6 +514,7 @@ async function writeSidecar(img: StoredImage): Promise<void> {
     aspectRatio: img.aspectRatio ?? null,
     imageSize: img.imageSize ?? null,
     modelUsed: img.modelUsed ?? null,
+    name: img.name ?? null,
     timestamp: img.timestamp,
   };
   try {
@@ -413,6 +678,7 @@ function startViewer(): Promise<number> {
               aspectRatio?: string | null;
               imageSize?: string | null;
               modelUsed?: string | null;
+              name?: string | null;
               timestamp?: number;
             };
 
@@ -473,7 +739,7 @@ function startViewer(): Promise<number> {
             }
             const finalSize = (typeof size === "string" && size) ? size : (source?.imageSize ?? "1K");
             const finalAspect = (typeof aspect === "string" && aspect) ? aspect : (source?.aspectRatio ?? "1:1");
-            const finalModel = (typeof respinModel === "string" && respinModel in MODELS) ? respinModel as ModelKey : undefined;
+            const finalModel = (typeof respinModel === "string" && lookupModel(respinModel)) ? respinModel : undefined;
             log(`respin: re-generating from "${finalPrompt.slice(0, 80)}..." (${finalSize}, ${finalAspect}${finalModel ? `, model=${finalModel}` : ""})`);
             const result = await generateAndStore(
               finalPrompt,
@@ -541,7 +807,7 @@ function viewerHtml(): string {
         </div>`;
       }
       const img = item.data;
-      const isFallback = img.modelUsed && img.modelUsed !== MODEL_PRIMARY && isGeminiModel(img.modelUsed);
+      const isFallback = img.modelUsed === MODEL_FALLBACK && MODEL_FALLBACK !== MODEL_PRIMARY;
       const fallbackBanner = isFallback
         ? `<div class="fallback-banner">⚠️ Generated with <strong>${esc(img.modelUsed!)}</strong> (free-tier fallback). Upgrade to <strong>${esc(MODEL_PRIMARY)}</strong> for higher-quality imagegen — <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.</div>`
         : "";
@@ -552,6 +818,7 @@ function viewerHtml(): string {
       const aspectOpts = RESPIN_ASPECTS.map(a => `<option value="${a}"${a === curAspect ? " selected" : ""}>${a}</option>`).join("");
       const modelOpts = MODEL_KEYS.map(k => `<option value="${k}"${MODELS[k].id === curModel ? " selected" : ""}>${esc(MODELS[k].label)}</option>`).join("");
       return `<div class="img-entry" id="img-${img.id}">
+          ${img.name ? `<div class="image-name">${esc(img.name)}</div>` : ""}
           <div class="prompt-row">
             <textarea class="prompt-edit" data-id="${img.id}">${esc(img.prompt)}</textarea>
             <div class="respin-controls">
@@ -604,6 +871,7 @@ function viewerHtml(): string {
   .video-badge { background: #6b2a2a; color: #ff8b8b; border: 1px solid #9b3a3a; padding: 8px 16px; font-size: 11px; font-family: system-ui; border-radius: 4px; white-space: nowrap; align-self: flex-start; font-weight: 600; letter-spacing: 0.5px; }
   .img-wrapper { position: relative; }
   .model-label { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #8bc4ff; padding: 3px 8px; font-size: 11px; font-family: monospace; border-radius: 3px; z-index: 1; pointer-events: none; }
+  .image-name { color: #8bc4ff; font-size: 13px; font-weight: 600; font-family: ui-monospace, monospace; margin-bottom: 4px; padding: 2px 0; letter-spacing: 0.3px; }
   .fallback-banner { background: #3a2e12; color: #f0c066; border: 1px solid #7a5c20; padding: 8px 12px; font-size: 12px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
   .fallback-banner a { color: #ffd988; text-decoration: underline; }
   .fallback-banner strong { color: #ffdf9e; }
@@ -658,12 +926,13 @@ const gallery = document.getElementById("gallery");
 const empty = document.getElementById("empty");
 const es = new EventSource("/events");
 const PRIMARY_MODEL = ${JSON.stringify(MODEL_PRIMARY)};
+const FALLBACK_MODEL = ${JSON.stringify(MODEL_FALLBACK)};
 const RESPIN_SIZES = ${JSON.stringify(RESPIN_SIZES)};
 const RESPIN_ASPECTS = ${JSON.stringify(RESPIN_ASPECTS)};
 const MODEL_OPTIONS = ${JSON.stringify(MODEL_KEYS.map(k => ({ key: k, label: MODELS[k].label, id: MODELS[k].id })))};
 es.onmessage = (e) => {
   const data = JSON.parse(e.data);
-  const { id, prompt, type, filename, modelUsed } = data;
+  const { id, prompt, type, filename, modelUsed, name } = data;
   empty.style.display = "none";
   if (type !== "video") {
     const topTa = document.getElementById("top-prompt-text");
@@ -695,6 +964,12 @@ es.onmessage = (e) => {
     div.appendChild(vid);
   } else {
     div.id = "img-" + id;
+    if (name) {
+      const nameEl = document.createElement("div");
+      nameEl.className = "image-name";
+      nameEl.textContent = name;
+      div.appendChild(nameEl);
+    }
     const row = document.createElement("div");
     row.className = "prompt-row";
     const ta = document.createElement("textarea");
@@ -747,7 +1022,7 @@ es.onmessage = (e) => {
     row.appendChild(ta);
     row.appendChild(controls);
     div.appendChild(row);
-    if (modelUsed && modelUsed !== PRIMARY_MODEL && modelUsed.startsWith('gemini')) {
+    if (modelUsed && modelUsed === FALLBACK_MODEL) {
       const banner = document.createElement("div");
       banner.className = "fallback-banner";
       banner.innerHTML = '\u26A0\uFE0F Generated with <strong>' + modelUsed + '</strong> (free-tier fallback). Upgrade to <strong>' + PRIMARY_MODEL + '</strong> for higher-quality imagegen \u2014 <a href="https://aistudio.google.com/" target="_blank">top up credits</a>.';
@@ -883,6 +1158,12 @@ function renderHistoryItems(items) {
     const curAspect = it.aspectRatio || "1:1";
     const meta = [fmtTs(it.timestamp), curSize, curAspect, it.modelUsed || "?"].filter(Boolean).join(" · ");
 
+    if (it.name) {
+      const nameEl = document.createElement("div");
+      nameEl.className = "image-name";
+      nameEl.textContent = it.name;
+      div.appendChild(nameEl);
+    }
     const row = document.createElement("div");
     row.className = "prompt-row";
     const ta = document.createElement("textarea");
@@ -1392,11 +1673,12 @@ class GeminiProvider implements ImageProvider {
   name = "gemini";
 
   async generate(req: GenerateRequest): Promise<ProviderResult> {
-    return this.call([{ text: req.prompt }], req.aspectRatio, req.imageSize);
+    return this.call(req.modelId, [{ text: req.prompt }], req.aspectRatio, req.imageSize);
   }
 
   async edit(req: EditRequest): Promise<ProviderResult> {
     return this.call(
+      req.modelId,
       [
         { text: req.prompt },
         { inlineData: { mimeType: req.imageMime, data: req.imageBase64 } },
@@ -1476,26 +1758,30 @@ class GeminiProvider implements ImageProvider {
     return { imageBase64, text };
   }
 
+  /**
+   * Calls the model that was asked for. Only the Gemini primary, on a setup where Gemini is the
+   * default provider, drops to the free-tier model when the account has no prepaid credit.
+   * Any other model fails with the provider's own error so the caller knows what happened.
+   */
   private async call(
+    modelId: string,
     inputParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
     aspectRatio: string,
     imageSize: string,
   ): Promise<ProviderResult> {
-    const defaultKey = getDefaultModelKey();
-    const isGeminiDefault = MODELS[defaultKey]?.provider === "gemini";
-
-    if (!isGeminiDefault) {
-      const result = await this.callOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
-      return { ...result, modelUsed: MODEL_PRIMARY };
-    }
+    const model = modelId || MODEL_PRIMARY;
+    const canFallBack =
+      model === MODEL_PRIMARY &&
+      MODEL_FALLBACK !== MODEL_PRIMARY &&
+      lookupModel(getDefaultModelKey())?.provider === "gemini";
 
     try {
-      const result = await this.callOnce(MODEL_PRIMARY, inputParts, aspectRatio, imageSize);
-      return { ...result, modelUsed: MODEL_PRIMARY };
+      const result = await this.callOnce(model, inputParts, aspectRatio, imageSize);
+      return { ...result, modelUsed: model };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (isPrepayError(msg)) {
-        log(`  Prepay error on ${MODEL_PRIMARY} — falling back to ${MODEL_FALLBACK}. Original: ${msg.slice(0, 300)}`);
+      if (canFallBack && isPrepayError(msg)) {
+        log(`  Prepay error on ${model} — falling back to ${MODEL_FALLBACK}. Original: ${msg.slice(0, 300)}`);
         const result = await this.callOnce(MODEL_FALLBACK, inputParts, aspectRatio, imageSize);
         return { ...result, modelUsed: MODEL_FALLBACK };
       }
@@ -1542,7 +1828,7 @@ const OPENAI_V2_SIZE_MAP: Record<string, Record<string, string>> = {
 };
 
 function openaiSize(modelId: string, aspectRatio: string, imageSize: string): string {
-  if (modelId === "gpt-image-2") {
+  if (/^gpt-image-([2-9]|\d{2,})/.test(modelId)) {
     return OPENAI_V2_SIZE_MAP[imageSize]?.[aspectRatio] ?? OPENAI_V2_SIZE_MAP["1K"][aspectRatio] ?? "1024x1024";
   }
   return OPENAI_V1_SIZE_MAP[aspectRatio] ?? "1024x1024";
@@ -1870,12 +2156,131 @@ async function callVeo(
   throw new Error(`Veo generation timed out after ${VEO_MAX_POLLS * VEO_POLL_INTERVAL / 1000}s`);
 }
 
+// --- OpenRouter video API (async submit / poll / download) ---
+
+/** Load a still from the shared dir for use as a video frame. Caps at 2048px, keeps PNG unless large. */
+async function loadForVideoFrame(filename: string): Promise<string> {
+  const filepath = join(SAVE_DIR, filename);
+  const buf = await readFile(filepath);
+  const metadata = await sharp(buf).metadata();
+  const width = metadata.width ?? 1024;
+  log(`  Frame image: ${filename} (${width}x${metadata.height}, ${(buf.length / 1024).toFixed(0)}KB)`);
+  if (width > 2048 || buf.length > 4_000_000) {
+    const resized = await sharp(buf).resize(Math.min(width, 2048)).jpeg({ quality: 92 }).toBuffer();
+    log(`  Compressed frame: ${(resized.length / 1024).toFixed(0)}KB JPEG`);
+    return `data:image/jpeg;base64,${resized.toString("base64")}`;
+  }
+  const ext = extname(filename).toLowerCase();
+  const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
+interface OpenRouterVideoRequest {
+  modelId: string;
+  prompt: string;
+  aspectRatio: string;
+  durationSeconds: number;
+  resolution: string;
+  generateAudio: boolean;
+  firstFrame?: string; // data URL
+  lastFrame?: string; // data URL
+}
+
+async function callOpenRouterVideo(req: OpenRouterVideoRequest): Promise<{ video: Buffer; cost?: number }> {
+  const t0 = Date.now();
+  const frames: Array<{ type: "image_url"; image_url: { url: string }; frame_type: "first_frame" | "last_frame" }> = [];
+  if (req.firstFrame) frames.push({ type: "image_url", image_url: { url: req.firstFrame }, frame_type: "first_frame" });
+  if (req.lastFrame) frames.push({ type: "image_url", image_url: { url: req.lastFrame }, frame_type: "last_frame" });
+
+  const body: Record<string, unknown> = {
+    model: req.modelId,
+    prompt: req.prompt,
+    duration: req.durationSeconds,
+    resolution: req.resolution,
+    aspect_ratio: req.aspectRatio,
+    generate_audio: req.generateAudio,
+  };
+  if (frames.length) body.frame_images = frames;
+
+  const headers = {
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/j-east/pixel-surgeon-mcp",
+    "X-Title": "pixel-surgeon-mcp",
+  };
+
+  log(`  Submitting to OpenRouter video (${req.modelId}, ${req.aspectRatio}, ${req.resolution}, ${req.durationSeconds}s, audio=${req.generateAudio}${frames.length ? `, frames=${frames.map((f) => f.frame_type).join("+")}` : ""})...`);
+
+  let res: Response;
+  try {
+    res = await fetch(OPENROUTER_VIDEO_BASE, { method: "POST", headers, body: JSON.stringify(body) });
+  } catch (fetchErr: unknown) {
+    throw new Error(`Network error calling OpenRouter video API: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+  }
+  const rawBody = await res.text();
+  let job: { id?: string; polling_url?: string; status?: string; error?: { message?: string } | string };
+  try {
+    job = JSON.parse(rawBody);
+  } catch {
+    throw new Error(`OpenRouter video API returned non-JSON (HTTP ${res.status}). Raw body: ${rawBody.slice(0, 2000)}`);
+  }
+  if (!res.ok || job.error) {
+    const msg = typeof job.error === "string" ? job.error : job.error?.message;
+    throw new Error(`OpenRouter video API HTTP ${res.status}: ${msg ?? rawBody.slice(0, 2000)}`);
+  }
+  if (!job.id) throw new Error(`OpenRouter video API returned no job id. Response: ${rawBody.slice(0, 2000)}`);
+
+  const pollUrl = job.polling_url ?? `${OPENROUTER_VIDEO_BASE}/${job.id}`;
+  log(`  OpenRouter video job ${job.id} (${job.status ?? "pending"})`);
+
+  for (let i = 0; i < OPENROUTER_VIDEO_MAX_POLLS; i++) {
+    await new Promise((r) => setTimeout(r, OPENROUTER_VIDEO_POLL_INTERVAL));
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+
+    const pollRes = await fetch(pollUrl, { headers: { Authorization: headers.Authorization } });
+    const pollBody = await pollRes.text();
+    let poll: {
+      status?: string;
+      error?: { message?: string } | string;
+      unsigned_urls?: string[];
+      urls?: string[];
+      usage?: { cost?: number };
+    };
+    try {
+      poll = JSON.parse(pollBody);
+    } catch {
+      log(`  Poll returned non-JSON (HTTP ${pollRes.status}), retrying...`);
+      continue;
+    }
+
+    log(`  Polling OpenRouter (${elapsed}s elapsed, ${poll.status ?? `HTTP ${pollRes.status}`})`);
+
+    if (poll.status === "failed" || (poll.error && poll.status !== "completed")) {
+      const msg = typeof poll.error === "string" ? poll.error : poll.error?.message;
+      throw new Error(`OpenRouter video generation failed: ${msg ?? pollBody.slice(0, 2000)}`);
+    }
+
+    if (poll.status === "completed") {
+      const contentUrl = poll.unsigned_urls?.[0] ?? poll.urls?.[0] ?? `${OPENROUTER_VIDEO_BASE}/${job.id}/content?index=0`;
+      log(`  Complete in ${((Date.now() - t0) / 1000).toFixed(1)}s${poll.usage?.cost != null ? ` (cost $${poll.usage.cost.toFixed(3)})` : ""}, downloading...`);
+      const dl = await fetch(contentUrl, { headers: { Authorization: headers.Authorization }, redirect: "follow" });
+      if (!dl.ok) throw new Error(`Failed to download video (HTTP ${dl.status}): ${(await dl.text()).slice(0, 500)}`);
+      const video = Buffer.from(await dl.arrayBuffer());
+      log(`  Downloaded video: ${(video.length / 1024 / 1024).toFixed(1)}MB`);
+      return { video, cost: poll.usage?.cost };
+    }
+  }
+
+  throw new Error(`OpenRouter video generation timed out after ${(OPENROUTER_VIDEO_MAX_POLLS * OPENROUTER_VIDEO_POLL_INTERVAL) / 1000}s (job ${job.id})`);
+}
+
 /** Generate, store, return shrunk for MCP */
 async function generateAndStore(
   prompt: string,
   aspectRatio: string,
   imageSize: string,
-  modelKey?: ModelKey
+  modelKey?: ModelKey,
+  name?: string
 ): Promise<{ mcpBase64: string; mcpMimeType: string; text: string; filename: string; modelUsed: string }> {
   lastPrompt = prompt;
   const { provider, modelId } = getProvider(modelKey);
@@ -1883,10 +2288,11 @@ async function generateAndStore(
 
   const fullPng = Buffer.from(imageBase64, "base64");
   const id = randomUUID();
-  const filename = await saveToDisk(fullPng, id.slice(0, 8));
-  log(`  Saved ${filename}`);
+  const label = name ? name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) : id.slice(0, 8);
+  const filename = await saveToDisk(fullPng, label);
+  log(`  Saved ${filename}${name ? ` (name: ${name})` : ""}`);
 
-  const img: StoredImage = { id, prompt, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize, modelUsed };
+  const img: StoredImage = { id, prompt, fullPng, timestamp: Date.now(), filename, aspectRatio, imageSize, modelUsed, name: name || undefined };
   imageStore.push(img);
   notifyViewerClients(img);
 
@@ -1928,34 +2334,37 @@ async function editAndStore(
 
 /** Notice text to append to MCP responses when the auto-fallback model was used. */
 const AUTO_FALLBACK_NOTICE =
-  `\u26A0\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image) — the free-tier-eligible fallback. ` +
-  `The primary ${MODEL_PRIMARY} (Gemini 3.1 Flash Image) requires a billed/prepaid Google AI account, ` +
+  `\u26A0\uFE0F Generated with ${MODEL_FALLBACK} (${MODELS[GEMINI_FALLBACK].label}) — the free-tier-eligible fallback. ` +
+  `The primary ${MODEL_PRIMARY} (${MODELS[GEMINI_DEFAULT].label}) requires a billed/prepaid Google AI account, ` +
   `and your prepayment credits appear to be depleted. For higher-quality image generation, ` +
   `top up credits at https://aistudio.google.com/ and re-run.`;
 
 /** Notice text when the user explicitly chose the free model. */
 const EXPLICIT_FREE_NOTICE =
-  `\u2139\uFE0F Generated with ${MODEL_FALLBACK} (Gemini 2.5 Flash Image, free tier, as requested). ` +
+  `\u2139\uFE0F Generated with ${MODEL_FALLBACK} (${MODELS[GEMINI_FALLBACK].label}, free tier, as requested). ` +
   `For higher-quality image generation, pass model='${GEMINI_DEFAULT}' — this requires prepaid credits on your Google AI account.`;
 
 const MODEL_PARAM_DESCRIPTION =
-  `Model to use. Available: ${MODEL_KEYS.map(k => `'${k}' (${MODELS[k].label})`).join(", ")}. ` +
+  `Model to use: a preset, or any raw provider model id (a model released after this server was built works without an update). ` +
+  `Presets: ${MODEL_KEYS.map(k => `'${k}' (${MODELS[k].label})`).join(", ")}. ` +
   `Default: '${getDefaultModelKey()}'. Set DEFAULT_IMAGE_MODEL env var to change the default. ` +
-  `Provider tradeoffs: grok-imagine is fastest and cheapest; gemini is mid-quality with the best price/performance ratio (free tier available); gpt-image-2 is highest quality but slower and more expensive. ` +
-  `Gemini models fall back to free tier on billing errors. OpenAI requires OPENAI_API_KEY. Grok requires XAI_API_KEY.`;
+  describeDiscovered(STARTUP_CATALOG) +
+  `Call list_models for the live list. Raw ids are routed by name (gemini-* and nano-banana-* to Google, gpt-image-* to OpenAI, grok-* to xAI); ` +
+  `prefix with google/, openai/ or xai/ when the name does not say. ` +
+  `Provider tradeoffs: grok is fastest and cheapest; gemini (Nano Banana) has the best price/performance ratio; gpt-image is highest quality but slower and more expensive. ` +
+  `The Gemini default falls back to the free tier on billing errors. Google needs GOOGLE_API_KEY, OpenAI needs OPENAI_API_KEY, Grok needs XAI_API_KEY.`;
 
-function noticeFor(modelUsed: string, explicitModelKey?: ModelKey): string {
-  if (explicitModelKey && MODELS[explicitModelKey]?.provider !== "gemini") return "";
-  if (modelUsed === MODEL_PRIMARY) return "";
-  const notice = explicitModelKey ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE;
-  return `\n\n${notice}`;
+/** The notice to append when an image came from the free-tier Gemini model, or "" when it did not. */
+function noticeFor(modelUsed: string, requestedModel?: ModelKey): string {
+  if (modelUsed !== MODEL_FALLBACK || MODEL_FALLBACK === MODEL_PRIMARY) return "";
+  const askedForIt = !!requestedModel && lookupModel(requestedModel)?.id === MODEL_FALLBACK;
+  return `\n\n${askedForIt ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE}`;
 }
 
 function resolveImageSize(imageSize: string, modelKey?: ModelKey): string {
   if (!modelKey) return imageSize;
-  const entry = MODELS[modelKey];
-  if (entry?.provider !== "gemini") return imageSize;
-  if (modelKey === "gemini-2.5-flash-image" && imageSize === "512") {
+  const id = lookupModel(modelKey)?.id;
+  if (id === "gemini-2.5-flash-image" && imageSize === "512") {
     log(`  Note: gemini-2.5-flash-image doesn't support image_size=512, using 1K instead`);
     return "1K";
   }
@@ -2008,6 +2417,42 @@ function resolveAspectRatio(explicit: string, style?: string): string {
 const server = new McpServer(
   { name: "pixel-surgeon", version: "1.0.0" },
   { capabilities: { tools: {} } }
+);
+
+server.tool(
+  "list_models",
+  "List the image models you can pass as `model`: the presets, the current default, and every image model each configured provider (Google, OpenAI, xAI) reports for its API key right now. Use it to find the newest model, or after an 'Unknown model' error. Read-only; costs nothing.",
+  {},
+  async () => {
+    try {
+      const catalog = await discoverModels();
+      const lines: string[] = [
+        `Default: ${getDefaultModelKey()}`,
+        "",
+        "Presets (short names):",
+        ...MODEL_KEYS.map((k) => `  ${k} -> ${MODELS[k].provider} ${MODELS[k].id} (${MODELS[k].label})`),
+      ];
+      for (const name of ["gemini", "openai", "xai"] as ProviderName[]) {
+        if (!providers[name]) {
+          lines.push("", `${name}: no API key configured`);
+          continue;
+        }
+        const error = catalog.errors[name];
+        lines.push("", `${name}, live from the provider${error ? ` (lookup failed: ${error}; showing the last saved list)` : ""}:`);
+        const models = catalog.providers[name] ?? [];
+        if (!models.length) lines.push("  (none found)");
+        for (const m of models) {
+          const extra = [m.label, m.created ? `released ${m.created}` : ""].filter(Boolean).join(", ");
+          lines.push(`  ${m.id}${extra ? ` (${extra})` : ""}`);
+        }
+      }
+      lines.push("", "Pass any id above as `model`. Models added after this server started may not be named in the `model` description, but they work.");
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text" as const, text: `list_models failed: ${msg}` }], isError: true };
+    }
+  }
 );
 
 server.tool(
@@ -2095,6 +2540,10 @@ server.tool(
       .min(1)
       .max(8)
       .describe("Array of text prompts, one per image to generate (1-8 images)"),
+    names: z
+      .array(z.string())
+      .optional()
+      .describe("Optional array of short human-readable names, one per prompt (e.g. ['front-v1', 'back-v1']). Used in filenames and shown in the viewer."),
     aspect_ratio: z
       .enum(["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"])
       .default("1:1")
@@ -2107,9 +2556,9 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ prompts, aspect_ratio, image_size, style, model }) => {
+  async ({ prompts, names, aspect_ratio, image_size, style, model }) => {
     try {
       await ensureViewer();
       const resolvedAR = resolveAspectRatio(aspect_ratio, style);
@@ -2120,8 +2569,9 @@ server.tool(
       const results = await Promise.allSettled(
         prompts.map((prompt, i) => {
           const styledPrompt = applyStyle(prompt, style);
-          log(`  [${i + 1}/${prompts.length}] "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}"`);
-          return generateAndStore(styledPrompt, resolvedAR, resolvedSize, model);
+          const imgName = names?.[i];
+          log(`  [${i + 1}/${prompts.length}] "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}"${imgName ? ` [name: ${imgName}]` : ""}`);
+          return generateAndStore(styledPrompt, resolvedAR, resolvedSize, model, imgName);
         })
       );
 
@@ -2136,7 +2586,7 @@ server.tool(
         const result = results[i];
         if (result.status === "fulfilled") {
           anySucceeded = true;
-          if (result.value.modelUsed !== MODEL_PRIMARY && isGeminiModel(result.value.modelUsed)) anyFallback = true;
+          if (result.value.modelUsed === MODEL_FALLBACK) anyFallback = true;
           content.push({
             type: "text" as const,
             text: `Image ${i + 1}: ${result.value.filename}${result.value.text ? ` — ${result.value.text}` : ""}`,
@@ -2159,7 +2609,7 @@ server.tool(
 
       content.push({
         type: "text" as const,
-        text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}${anyFallback ? `\n\n${model ? EXPLICIT_FREE_NOTICE : AUTO_FALLBACK_NOTICE}` : ""}`,
+        text: `Full-res images in ${SAVE_DIR} — viewable at http://localhost:${viewerPort}${anyFallback ? noticeFor(MODEL_FALLBACK, model) : ""}`,
       });
 
       if (!anySucceeded) return { content, isError: true };
@@ -2180,6 +2630,7 @@ server.tool(
   "Generate a single image. Supports Gemini and OpenAI models — pass the model param to choose. Full-resolution image is viewable in the browser viewer.",
   {
     prompt: z.string().describe("Text prompt describing the image to generate"),
+    name: z.string().optional().describe("Short human-readable name for this image (e.g. 'hero-banner', 'logo-v2'). Used in the filename and shown in the viewer. Keep it concise."),
     aspect_ratio: z
       .enum(["1:1", "16:9", "9:16", "3:4", "4:3", "2:3", "3:2", "4:5", "5:4"])
       .default("1:1")
@@ -2192,18 +2643,18 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
-  async ({ prompt, aspect_ratio, image_size, style, model }) => {
+  async ({ prompt, name, aspect_ratio, image_size, style, model }) => {
     try {
       await ensureViewer();
       const styledPrompt = applyStyle(prompt, style);
       const resolvedAR = resolveAspectRatio(aspect_ratio, style);
-      log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}${model ? ` [model: ${model}]` : ""}`);
+      log(`generate_image: "${styledPrompt.slice(0, 80)}${styledPrompt.length > 80 ? "..." : ""}" (${image_size}, ${resolvedAR})${style ? ` [style: ${style}]` : ""}${model ? ` [model: ${model}]` : ""}${name ? ` [name: ${name}]` : ""}`);
       const t0 = Date.now();
 
       const resolvedSize = resolveImageSize(image_size, model);
-      const { mcpBase64, mcpMimeType, text, filename, modelUsed } = await generateAndStore(styledPrompt, resolvedAR, resolvedSize, model);
+      const { mcpBase64, mcpMimeType, text, filename, modelUsed } = await generateAndStore(styledPrompt, resolvedAR, resolvedSize, model, name);
 
       log(`generate_image complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
@@ -2227,32 +2678,98 @@ server.tool(
 
 server.tool(
   "generate_video",
-  "Generate a video using Google's Veo 3. Returns an MP4 video file. Video generation takes 1-3 minutes — the tool will poll until complete. Veo 3 generates both video and ambient audio. Videos are saved to the shared directory and viewable in the browser viewer.",
+  `Generate a video from a text prompt, or animate an existing image (image-to-video). Routes through OpenRouter's video API when OPENROUTER_API_KEY is set (Veo, Kling, Seedance, Wan, Hailuo, Grok, Runway); otherwise falls back to Google Veo direct via GOOGLE_API_KEY. Takes 1-5 minutes; the tool polls until complete. Returns an MP4 saved to ${SAVE_DIR} and viewable in the browser viewer. To animate a pixel-surgeon image, pass its filename as \`image\` (use list_images).`,
   {
-    prompt: z.string().describe("Text prompt describing the video to generate. Be descriptive about motion, camera angles, lighting, and scene details for best results."),
+    prompt: z.string().describe("Text prompt describing the video. Describe motion, camera movement, lighting, and scene. For image-to-video, describe what should happen starting from the image."),
+    model: z.string().optional().describe(VIDEO_MODEL_PARAM_DESCRIPTION),
     aspect_ratio: z
-      .enum(["16:9", "9:16"])
+      .enum(VIDEO_ASPECTS)
       .default("16:9")
-      .describe("Aspect ratio — 16:9 for landscape, 9:16 for portrait/vertical"),
+      .describe("Aspect ratio. Snapped to the nearest the model supports (Veo and Runway: 16:9 or 9:16 only)."),
     duration: z
-      .enum(["5", "8"])
-      .default("8")
-      .describe("Video duration in seconds"),
+      .number()
+      .int()
+      .min(1)
+      .max(15)
+      .default(8)
+      .describe("Duration in seconds. Snapped to the nearest the model supports (Veo: 4, 6, 8)."),
+    resolution: z
+      .enum(VIDEO_RESOLUTIONS)
+      .default("720p")
+      .describe("Output resolution. Snapped to the nearest the model supports. 1080p costs more on most models."),
+    audio: z
+      .boolean()
+      .default(true)
+      .describe("Generate audio where the model supports it (Veo, Kling, Seedance, Wan, Hailuo). Audio roughly doubles Veo cost."),
+    image: z
+      .string()
+      .optional()
+      .describe(`Optional first-frame image: filename in ${SAVE_DIR} (image-to-video). The MCP reads the file; do NOT pass base64.`),
+    last_image: z
+      .string()
+      .optional()
+      .describe(`Optional last-frame image filename in ${SAVE_DIR}. Only honored by models that support last frames (Veo, Kling, Seedance, Wan, Hailuo).`),
   },
-  async ({ prompt, aspect_ratio, duration }) => {
+  async ({ prompt, model, aspect_ratio, duration, resolution, audio, image, last_image }) => {
     try {
       await ensureViewer();
-      const durationSeconds = parseInt(duration, 10);
-      log(`generate_video: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" (${aspect_ratio}, ${durationSeconds}s)`);
       const t0 = Date.now();
 
-      const videoBuffer = await callVeo(prompt, aspect_ratio, durationSeconds);
+      let videoBuffer: Buffer;
+      let modelUsed: string;
+      let costNote = "";
+      let aspectUsed: string = aspect_ratio;
+      let durationUsed: number = duration;
+
+      if (OPENROUTER_API_KEY) {
+        const key = model ?? DEFAULT_VIDEO_MODEL;
+        const entry = VIDEO_MODELS[key];
+        const modelId = entry?.id ?? key;
+        if (!entry && !key.includes("/")) {
+          throw new Error(`Unknown video model "${key}". Use one of: ${VIDEO_MODEL_KEYS.join(", ")} or a raw OpenRouter id like "alibaba/wan-3.0".`);
+        }
+        aspectUsed = snapToSupported(aspect_ratio, entry?.aspects, "aspect_ratio");
+        durationUsed = snapToSupported(duration, entry?.durations, "duration");
+        const resolutionUsed = snapToSupported(resolution, entry?.resolutions, "resolution");
+        const generateAudio = audio && (entry?.audio ?? true);
+
+        log(`generate_video: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" [${modelId}] (${aspectUsed}, ${resolutionUsed}, ${durationUsed}s${image ? `, image=${image}` : ""}${last_image ? `, last_image=${last_image}` : ""})`);
+
+        const firstFrame = image ? await loadForVideoFrame(image) : undefined;
+        let lastFrame: string | undefined;
+        if (last_image) {
+          if (entry && !entry.lastFrame) log(`  last_image ignored: ${entry.label} does not support last frames`);
+          else lastFrame = await loadForVideoFrame(last_image);
+        }
+
+        const result = await callOpenRouterVideo({
+          modelId, prompt, aspectRatio: aspectUsed, durationSeconds: durationUsed,
+          resolution: resolutionUsed, generateAudio, firstFrame, lastFrame,
+        });
+        videoBuffer = result.video;
+        modelUsed = modelId;
+        if (result.cost != null) costNote = ` Cost: $${result.cost.toFixed(3)}.`;
+      } else if (GOOGLE_API_KEY) {
+        if (model && model !== "veo-3.1" && model !== "veo-3.1-fast") {
+          log(`  OPENROUTER_API_KEY not set; ignoring model=${model} and using Veo direct`);
+        }
+        if (image || last_image) {
+          throw new Error("image-to-video requires OPENROUTER_API_KEY (Veo direct path is text-only). Set OPENROUTER_API_KEY to enable it.");
+        }
+        aspectUsed = aspect_ratio === "9:16" ? "9:16" : "16:9";
+        durationUsed = duration <= 5 ? 5 : 8;
+        log(`generate_video: "${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}" [veo direct] (${aspectUsed}, ${durationUsed}s)`);
+        videoBuffer = await callVeo(prompt, aspectUsed, durationUsed);
+        modelUsed = VEO_MODEL;
+      } else {
+        throw new Error("No video provider available. Set OPENROUTER_API_KEY (recommended, many models) or GOOGLE_API_KEY (Veo direct).");
+      }
 
       const id = randomUUID();
       const filename = await saveToDisk(videoBuffer, id.slice(0, 8), ".mp4");
       log(`  Saved video ${filename} (${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB)`);
 
-      const vid: StoredVideo = { id, prompt, filename, timestamp: Date.now(), aspectRatio: aspect_ratio, durationSeconds };
+      const vid: StoredVideo = { id, prompt, filename, timestamp: Date.now(), aspectRatio: aspectUsed, durationSeconds: durationUsed, modelUsed };
       videoStore.push(vid);
       notifyViewerClientsVideo(vid);
 
@@ -2261,7 +2778,7 @@ server.tool(
 
       return {
         content: [
-          { type: "text" as const, text: `Video generated successfully in ${elapsed}s` },
+          { type: "text" as const, text: `Video generated in ${elapsed}s with ${modelUsed} (${aspectUsed}, ${durationUsed}s).${costNote}` },
           { type: "text" as const, text: `Saved as ${filename} in ${SAVE_DIR} (${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB)` },
           { type: "text" as const, text: `Viewable at http://localhost:${viewerPort}` },
         ],
@@ -2295,7 +2812,7 @@ server.tool(
       .enum(STYLE_KEYS)
       .optional()
       .describe(STYLE_DESCRIPTION),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
   async ({ prompt, filename, aspect_ratio, image_size, style, model }) => {
     try {
@@ -2354,7 +2871,7 @@ server.tool(
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
       .describe("Resolution for each tile"),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
   async ({ filename, prompt, grid, image_size, model }) => {
     try {
@@ -2600,7 +3117,7 @@ server.tool(
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
       .describe("Resolution for the cropped region"),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
   async ({ filename, prompt, x, y, width, height, image_size, model }) => {
     try {
@@ -2719,7 +3236,7 @@ server.tool(
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
       .describe("Resolution for the cropped region"),
-    model: z.enum(MODEL_KEYS).optional().describe(MODEL_PARAM_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_PARAM_DESCRIPTION),
   },
   async ({ filename, image_size, model }) => {
     let completeResolve!: (val: CropResult) => void;
@@ -3100,6 +3617,11 @@ async function main() {
     providers["xai"] = new GrokProvider();
     log("xAI/Grok provider available");
   }
+  if (OPENROUTER_API_KEY) {
+    log(`OpenRouter video available (default model: ${DEFAULT_VIDEO_MODEL})`);
+  } else if (GOOGLE_API_KEY) {
+    log("Video via Google Veo direct (set OPENROUTER_API_KEY for more models + image-to-video)");
+  }
 
   if (process.argv.includes("--viewer")) {
     if (!GOOGLE_API_KEY && !OPENAI_API_KEY && !XAI_API_KEY) {
@@ -3115,6 +3637,9 @@ async function main() {
     log("WARNING: No API keys set (GOOGLE_API_KEY, OPENAI_API_KEY, XAI_API_KEY). No image providers available.");
   }
   log(`Default model: ${getDefaultModelKey()}`);
+  discoverModels()
+    .then((c) => log(`Model catalog refreshed: ${Object.entries(c.providers).map(([p, m]) => `${p}=${m?.length ?? 0}`).join(", ")}`))
+    .catch((err) => log(`Model catalog refresh failed: ${err instanceof Error ? err.message : String(err)}`));
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

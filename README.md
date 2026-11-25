@@ -38,9 +38,11 @@ OpenAI's latest image model with dramatically improved text rendering and visual
 
 xAI's Aurora-powered image model. Fastest generation speed and lowest cost. Supports 7 aspect ratios at fixed resolutions (~1K). Good for rapid prototyping and iteration.
 
-### Veo 3 (Video)
+### Video (OpenRouter or Veo direct)
 
-For video, the server calls **Veo 3** with async polling — generating both video and ambient audio. Supports 16:9 and 9:16 at 5s or 8s duration.
+With `OPENROUTER_API_KEY` set, `generate_video` routes through [OpenRouter's video API](https://openrouter.ai/docs/features/multimodal/video-generation): Veo 3.1 (default: `veo-3.1-fast`), Kling 3.0, Seedance 2.0, Wan 2.7, Hailuo 3, Grok Imagine Video, Runway Gen-4.5, plus any raw OpenRouter video model id. Supports text-to-video and image-to-video (first frame, and last frame where the model allows it), 480p to 1080p, 1 to 15 seconds, and native audio on models that have it. Unsupported durations, aspect ratios, and resolutions are snapped to the nearest the model accepts. Set `DEFAULT_VIDEO_MODEL` to change the default.
+
+Without an OpenRouter key, it falls back to calling **Veo 3.1** directly with `GOOGLE_API_KEY` (text-to-video only, 16:9 or 9:16, 5s or 8s).
 
 ### Region repair
 
@@ -52,7 +54,7 @@ AI image models struggle with text-heavy images. The fix tools solve this by sen
 |------|-------------|
 | `generate_image` | Text-to-image generation (single image) |
 | `generate_images` | Parallel batch generation (1-8 images) |
-| `generate_video` | Text-to-video via Veo 3 with audio (5s or 8s) |
+| `generate_video` | Text-to-video or image-to-video via OpenRouter (Veo, Kling, Seedance, Wan, Hailuo, Grok, Runway) or Veo direct |
 | `edit_image` | Edit an existing image with natural language instructions |
 | `fix_image` | Grid-based tile repair for garbled text (2x2, 3x3, etc.) |
 | `fix_region` | Targeted region repair with automatic aspect ratio snapping |
@@ -65,7 +67,9 @@ AI image models struggle with text-heavy images. The fix tools solve this by sen
 
 | Model | Provider | Resolution | Best for |
 |-------|----------|-----------|----------|
-| `gemini-3.1-flash-image` | Google | 512 / 1K / 2K / 4K | General image generation, photo-realistic scenes |
+| `nano-banana-2.1` | Google | 512 / 1K / 2K / 4K | Newest Nano Banana; the Gemini default |
+| `nano-banana-pro` | Google | 512 / 1K / 2K / 4K | Nano Banana Pro (Gemini 3 Pro Image) |
+| `gemini-3.1-flash-image` | Google | 512 / 1K / 2K / 4K | Nano Banana 2; general image generation, photo-realistic scenes |
 | `gemini-2.5-flash-image` | Google | 1K max (free tier) | Quick drafts, prototyping |
 | `gpt-image-2` | OpenAI | Flexible (up to 4K) | Text-heavy images, infographics, diagrams, typography |
 | `gpt-image-1` | OpenAI | 3 fixed sizes | Legacy support |
@@ -73,9 +77,15 @@ AI image models struggle with text-heavy images. The fix tools solve this by sen
 
 Force a specific model per-call via the `model` tool parameter, or set `DEFAULT_IMAGE_MODEL` env var.
 
+### Newer models work without an update
+
+The table above is a set of short preset names, not a whitelist. `model` (and `DEFAULT_IMAGE_MODEL`) also accept any raw provider model id, for example `gemini-nano-banana-2.1`, `gpt-image-2.6-flare` or `grok-imagine-image-2.0`. Ids are routed by name (`gemini-*` and `nano-banana-*` to Google, `gpt-image-*` to OpenAI, `grok-*` to xAI); prefix with `google/`, `openai/` or `xai/` when the name does not say.
+
+The `list_models` tool asks each configured provider which image models your key can use right now. The server also runs that lookup in the background at every start and saves it to `~/.cache/pixel-surgeon-mcp/models.json`, so the `model` parameter description names the models found at the previous start.
+
 ### Gemini automatic fallback
 
-If a Gemini generation call fails with a billing / prepay error, the server automatically retries on the free-tier **`gemini-2.5-flash-image`** model. The viewer shows a yellow banner when this happens. Free-tier limits: 1K max resolution, 10 RPM, 500 RPD.
+If a call to the Gemini default (`nano-banana-2.1`) fails with a billing / prepay error, and Gemini is your default provider, the server automatically retries on the free-tier **`gemini-2.5-flash-image`** model. The viewer shows a yellow banner when this happens. Free-tier limits: 1K max resolution, 10 RPM, 500 RPD.
 
 ## Style presets
 
@@ -147,6 +157,7 @@ claude mcp add pixel-surgeon \
   -e GOOGLE_API_KEY=your-google-key \
   -e OPENAI_API_KEY=your-openai-key \
   -e XAI_API_KEY=your-xai-key \
+  -e OPENROUTER_API_KEY=your-openrouter-key \
   -- npx pixel-surgeon-mcp
 ```
 
@@ -161,7 +172,8 @@ claude mcp add pixel-surgeon \
       "env": {
         "GOOGLE_API_KEY": "your-google-api-key",
         "OPENAI_API_KEY": "your-openai-api-key",
-        "XAI_API_KEY": "your-xai-api-key"
+        "XAI_API_KEY": "your-xai-api-key",
+        "OPENROUTER_API_KEY": "your-openrouter-api-key"
       }
     }
   }
@@ -212,7 +224,7 @@ Add entries to the `STYLE_PRESETS` object in `src/index.ts`. Your PR should incl
 
 ### Model adapters
 
-The server currently supports Gemini, OpenAI, Grok Imagine, and Veo 3. We'd love adapters for other image/video generation APIs — Stable Diffusion, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
+The server currently supports Gemini, OpenAI, Grok Imagine for images, and OpenRouter (Veo, Kling, Seedance, Wan, Hailuo, Grok, Runway) or Veo direct for video. We'd love adapters for other image/video generation APIs — Stable Diffusion, Flux, etc. If you're interested in adding one, open an issue first so we can align on the interface.
 
 ## Built by Duval Software
 

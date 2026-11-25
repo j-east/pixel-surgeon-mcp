@@ -12,8 +12,12 @@ MCP server on stdio transport. Single source file: `src/index.ts`.
 Multi-provider image generation via `ImageProvider` interface. Each provider implements `generate()` and `edit()`. Providers are registered at startup based on available API keys.
 
 ### Providers
-- **Gemini** (`GeminiProvider`) — Google's nanobanana2 pipeline. Gemini 3.1 Flash Image (paid) with auto-fallback to 2.5 Flash Image (free) on billing errors. Supports 9 aspect ratios and 4 image sizes.
+- **Gemini** (`GeminiProvider`) — Google's Nano Banana models. Calls the model it is asked for. The primary (`nano-banana-2.1`, paid) auto-falls back to 2.5 Flash Image (free) on billing errors, only when Gemini is the default provider. Supports 9 aspect ratios and 4 image sizes.
 - **OpenAI** (`OpenAIProvider`) — GPT Image 1 and GPT Image 2. gpt-image-1 maps to 3 fixed sizes; gpt-image-2 supports flexible resolutions (true 2K/4K at all 9 aspect ratios). Image size param mapped to quality (medium/high). Prefer gpt-image-2 for text-heavy images — it has dramatically better text rendering.
+
+### Models
+`MODELS` holds preset short names, not a whitelist. `lookupModel()` also accepts any raw provider id (routed by name: `gemini-*`/`nano-banana-*`, `gpt-image-*`, `grok-*`) or `google/<id>`, `openai/<id>`, `xai/<id>`. A new model from an existing provider needs no code change; add a preset only for a short name or when it needs its own size handling.
+`discoverModels()` asks each provider's model-list endpoint, backs the `list_models` tool, runs in the background at start, and saves to `~/.cache/pixel-surgeon-mcp/models.json`, which the next start reads to name live models in the `model` parameter description.
 
 ### Adding a new provider
 1. Implement `ImageProvider` interface (generate + edit)
@@ -30,6 +34,7 @@ Video generation uses Veo 3 (async API with polling, Gemini only). Supports 16:9
 - `generate_video` — text-to-video via Veo 3 (async polling, 1-3 min, generates audio)
 - `edit_image` — edit existing image with instructions
 - `list_images` / `save_image` — file management
+- `list_models` — presets, default, and each provider's live image models for the configured keys
 - `fix_image` — grid-based tile repair (2x2, 3x3, etc.)
 - `fix_region` — targeted region repair (percentage coords, auto aspect ratio snap)
 - `interactive_fix` — browser crop UI with multi-shot (1-5 parallel shots, user picks best)
@@ -53,7 +58,7 @@ To add a new preset: add an entry to the `STYLE_PRESETS` object in `src/index.ts
 ## Environment
 - `GOOGLE_API_KEY` — enables Gemini provider
 - `OPENAI_API_KEY` — enables OpenAI provider
-- `DEFAULT_IMAGE_MODEL` — optional, sets default model (e.g. `gpt-image-1`). Falls back to `gemini-3.1-flash-image`.
+- `DEFAULT_IMAGE_MODEL` — optional, sets default model: a preset or a raw provider id (e.g. `gpt-image-2.6-flare`). Otherwise `gpt-image-2` when an OpenAI key is set, else `nano-banana-2.1`.
 - At least one API key must be set
 - Viewer auto-opens browser on first tool use (random local port)
 
